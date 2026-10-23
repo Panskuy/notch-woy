@@ -138,7 +138,11 @@ fn connected(classic: &HSTRING, le: &HSTRING, kinds: &mut HashMap<String, Device
             if name.is_empty() || devices.iter().any(|(_, d)| d.name == name) {
                 continue;
             }
-            let kind = *kinds.entry(id.clone()).or_insert_with(|| lookup_kind(&id, is_le));
+            let kind = *kinds.entry(id.clone()).or_insert_with(|| match lookup_kind(&id, is_le) {
+                // Some devices report no class at all; their name may still tell.
+                DeviceKind::Other => kind_from_name(&name),
+                kind => kind,
+            });
             devices.push((id, Device { name, kind }));
         }
     }
@@ -191,9 +195,33 @@ fn kind_from_appearance(raw: u16) -> DeviceKind {
     }
 }
 
+/// A guess from the name, for devices that report no class.
+fn kind_from_name(name: &str) -> DeviceKind {
+    let name = name.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| name.contains(w));
+    if has(&["keyboard", "keychron", "k380", "k780"]) {
+        DeviceKind::Keyboard
+    } else if has(&["mouse", "mx master", "mx anywhere", "trackpad"]) {
+        DeviceKind::Mouse
+    } else if has(&["buds", "pods", "headphone", "headset", "earphone", "tws", "wh-", "wf-", "jbl", "soundcore"]) {
+        DeviceKind::Headphones
+    } else {
+        DeviceKind::Other
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guesses_from_names() {
+        assert_eq!(kind_from_name("Galaxy Buds2 Pro"), DeviceKind::Headphones);
+        assert_eq!(kind_from_name("Sony WH-1000XM5"), DeviceKind::Headphones);
+        assert_eq!(kind_from_name("Logitech MX Master 3S"), DeviceKind::Mouse);
+        assert_eq!(kind_from_name("Keychron K2"), DeviceKind::Keyboard);
+        assert_eq!(kind_from_name("AULA-S75Pro-1"), DeviceKind::Other);
+    }
 
     #[test]
     fn classifies_classic_devices() {

@@ -1,8 +1,10 @@
 //! Watches the default output device's volume and mute, from any source
-//! (keyboard keys, the taskbar slider, apps), and follows the default
-//! device when it changes (headphones plugged in...).
+//! (keyboard keys, the taskbar slider, apps), follows the default device
+//! when it changes (headphones plugged in...), and sets them for the
+//! Control Center page.
 
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use windows::core::{implement, Result, PCWSTR};
@@ -21,27 +23,64 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 /// the volume in percent; `lparam` is 1 when muted.
 pub const WM_VOLUME: u32 = WM_APP + 4;
 
-/// Starts watching on a background thread for the life of the app.
-pub fn spawn(hwnd: HWND) {
-    // HWND is not Send; pass the raw handle value across.
-    let raw = hwnd.0 as isize;
-    thread::spawn(move || {
-        if let Err(e) = run(raw) {
-            eprintln!("volume watcher stopped: {e}");
-        }
-    });
+/// What the watcher thread waits for.
+enum Message {
+    DefaultDeviceChanged,
+    SetLevel(f32),
+    SetMute(bool),
 }
 
-fn run(hwnd: isize) -> Result<()> {
+/// The current output level (0..1) and mute.
+type Level = Arc<Mutex<(f32, bool)>>;
+
+pub struct Volume {
+    messages: Sender<Message>,
+    level: Level,
+}
+
+impl Volume {
+    /// Starts watching on a background thread for the life of the app.
+    pub fn spawn(hwnd: HWND) -> Self {
+        let (messages, rx) = mpsc::channel();
+        let level = Arc::new(Mutex::new((0.0, false)));
+        let shared = level.clone();
+        let device_changed = messages.clone();
+        // HWND is not Send; pass the raw handle value across.
+        let raw = hwnd.0 as isize;
+        thread::spawn(move || {
+            if let Err(e) = run(raw, rx, device_changed, shared) {
+                eprintln!("volume watcher stopped: {e}");
+            }
+        });
+        Self { messages, level }
+    }
+
+    /// Level 0..1 and mute, as last read or reported.
+    pub fn level(&self) -> (f32, bool) {
+        *self.level.lock().unwrap()
+    }
+
+    pub fn set_level(&self, level: f32) {
+        // Shown right away; the device's own report follows.
+        self.level.lock().unwrap().0 = level;
+        let _ = self.messages.send(Message::SetLevel(level));
+    }
+
+    pub fn set_mute(&self, muted: bool) {
+        self.level.lock().unwrap().1 = muted;
+        let _ = self.messages.send(Message::SetMute(muted));
+    }
+}
+
+fn run(hwnd: isize, rx: mpsc::Receiver<Message>, device_changed: Sender<Message>, level: Level) -> Result<()> {
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
         let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
 
-        let (device_changed, rx) = mpsc::channel();
         let client: IMMNotificationClient = DeviceWatcher { device_changed }.into();
         devices.RegisterEndpointNotificationCallback(&client)?;
 
-        let callback: IAudioEndpointVolumeCallback = VolumeCallback { hwnd }.into();
+        let callback: IAudioEndpointVolumeCallback = VolumeCallback { hwnd, level: level.clone() }.into();
         loop {
             // Without an output device there is nothing to watch until one
             // appears.
@@ -50,10 +89,38 @@ fn run(hwnd: isize) -> Result<()> {
                 .and_then(|device| device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None));
             if let Ok(endpoint) = &endpoint {
                 endpoint.RegisterControlChangeNotify(&callback)?;
+                let current = (
+                    endpoint.GetMasterVolumeLevelScalar().unwrap_or(0.0),
+                    endpoint.GetMute().is_ok_and(|m| m.as_bool()),
+                );
+                *level.lock().unwrap() = current;
             }
-            // Wait for the default device to change, then move over.
-            if rx.recv().is_err() {
-                return Ok(());
+            // Serve slider changes until the default device changes, then
+            // move over to the new one.
+            loop {
+                let Ok(message) = rx.recv() else { return Ok(()) };
+                let Ok(endpoint) = &endpoint else {
+                    if matches!(message, Message::DefaultDeviceChanged) {
+                        break;
+                    }
+                    continue;
+                };
+                match message {
+                    Message::DefaultDeviceChanged => break,
+                    Message::SetLevel(v) => {
+                        // A drag sends a burst; only the latest value matters.
+                        let latest = rx.try_iter().fold(Some(v), |v, m| match m {
+                            Message::SetLevel(v) => Some(v),
+                            _ => v,
+                        });
+                        if let Some(v) = latest {
+                            let _ = endpoint.SetMasterVolumeLevelScalar(v.clamp(0.0, 1.0), std::ptr::null());
+                        }
+                    }
+                    Message::SetMute(muted) => {
+                        let _ = endpoint.SetMute(muted, std::ptr::null());
+                    }
+                }
             }
             if let Ok(endpoint) = &endpoint {
                 let _ = endpoint.UnregisterControlChangeNotify(&callback);
@@ -65,11 +132,13 @@ fn run(hwnd: isize) -> Result<()> {
 #[implement(IAudioEndpointVolumeCallback)]
 struct VolumeCallback {
     hwnd: isize,
+    level: Level,
 }
 
 impl IAudioEndpointVolumeCallback_Impl for VolumeCallback_Impl {
     fn OnNotify(&self, data: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> Result<()> {
         let Some(data) = (unsafe { data.as_ref() }) else { return Ok(()) };
+        *self.level.lock().unwrap() = (data.fMasterVolume, data.bMuted.as_bool());
         let percent = (data.fMasterVolume * 100.0).round() as usize;
         let muted = data.bMuted.as_bool() as isize;
         unsafe {
@@ -118,7 +187,8 @@ mod tests {
                 .unwrap()
                 .Activate(CLSCTX_ALL, None)
                 .unwrap();
-            let callback: IAudioEndpointVolumeCallback = VolumeCallback { hwnd: hwnd.0 as isize }.into();
+            let level = Arc::new(Mutex::new((0.0, false)));
+            let callback: IAudioEndpointVolumeCallback = VolumeCallback { hwnd: hwnd.0 as isize, level }.into();
             endpoint.RegisterControlChangeNotify(&callback).unwrap();
 
             let original = endpoint.GetMasterVolumeLevelScalar().unwrap();
@@ -153,13 +223,13 @@ mod tests {
 
 #[implement(IMMNotificationClient)]
 struct DeviceWatcher {
-    device_changed: Sender<()>,
+    device_changed: Sender<Message>,
 }
 
 impl IMMNotificationClient_Impl for DeviceWatcher_Impl {
     fn OnDefaultDeviceChanged(&self, flow: EDataFlow, role: ERole, _id: &PCWSTR) -> Result<()> {
         if flow == eRender && role == eConsole {
-            let _ = self.device_changed.send(());
+            let _ = self.device_changed.send(Message::DefaultDeviceChanged);
         }
         Ok(())
     }

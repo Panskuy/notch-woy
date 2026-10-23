@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 fontdue = "0.9"
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_System_LibraryLoader", "Win32_Graphics_Dwm", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_System_Registry", "Foundation", "Media_Control", "Storage_Streams", "Graphics_Imaging", "Win32_System_Com", "Web_Http", "Web_Http_Headers", "Data_Json", "Win32_System_Power", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "UI_Notifications_Management", "UI_Notifications", "ApplicationModel", "Win32_UI_Accessibility", "Devices_Bluetooth", "Devices_Enumeration"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_System_LibraryLoader", "Win32_Graphics_Dwm", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_System_Registry", "Foundation", "Media_Control", "Storage_Streams", "Graphics_Imaging", "Win32_System_Com", "Web_Http", "Web_Http_Headers", "Data_Json", "Win32_System_Power", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "UI_Notifications_Management", "UI_Notifications", "ApplicationModel", "Win32_UI_Accessibility", "Devices_Bluetooth", "Devices_Enumeration", "Devices_Radios", "Win32_System_Wmi", "Win32_System_Ole", "Win32_Security", "Win32_Devices_Display"] }
 # `#[implement]` (COM callbacks in volume.rs) expands to paths in this crate.
 windows-core = "0.61"
 

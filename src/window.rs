@@ -18,13 +18,15 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::anim::Spring;
 use crate::appbar::{self, WM_APPBAR};
 use crate::battery::{self, Battery};
-use crate::volume::{self, WM_VOLUME};
+use crate::bluetooth::{Bluetooth, Device, WM_BLUETOOTH};
+use crate::controls::{ControlCommand, ControlState, Controls, WM_CONTROLS};
+use crate::volume::{Volume, WM_VOLUME};
 use crate::lyrics::{Fetcher, LyricsState, Query, WM_LYRICS};
 use crate::media::{self, Command, Media, NowPlaying, WM_MEDIA};
 use crate::notifications::{Notifications, WM_TOAST};
 use crate::render::{
-    self, Alert, Button, Fonts, LyricsView, Scene, Shape, Transition, COLLAPSED,
-    COLLAPSED_BATTERY_WIDTH, EXPANDED, MINI, PLAYER_ONLY_WIDTH,
+    self, Alert, Button, ControlHit, ControlsView, Fonts, LyricsView, Scene, Shape, Slider, Toggle,
+    Transition, COLLAPSED, COLLAPSED_BATTERY_WIDTH, EXPANDED, MINI, PLAYER_ONLY_WIDTH,
 };
 
 /// Window canvas in logical pixels. It fits the expanded notch plus spring
@@ -47,6 +49,7 @@ const BATTERY_ALERT_MS: u32 = 3000;
 /// Counted from the last change, so holding a volume key keeps it open.
 const VOLUME_ALERT_MS: u32 = 1500;
 const TOAST_ALERT_MS: u32 = 5000;
+const BLUETOOTH_ALERT_MS: u32 = 3000;
 /// How long a notification lingers after the pointer leaves it.
 const TOAST_GRACE_MS: u32 = 2000;
 
@@ -93,6 +96,18 @@ struct App {
     /// Volume alert slider, in percent.
     volume: Spring,
     notifications: Notifications,
+    bluetooth: Bluetooth,
+    /// The device the resting notch's indicator shows.
+    bluetooth_device: Option<Device>,
+    audio: Volume,
+    controls: Controls,
+    control_state: ControlState,
+    /// Open notch page, 0 (player) .. 100 (Control Center).
+    page: Spring,
+    /// Wheel travel not yet turned into a page change.
+    wheel: i32,
+    /// A Control Center slider being dragged, with its value (0..1).
+    slider_drag: Option<(Slider, f32)>,
     /// The active window reaches under the notch (a maximized window's
     /// title bar or tabs), so it shrinks to a mini pill.
     obstructed: bool,
@@ -139,7 +154,6 @@ pub fn run() -> Result<()> {
 
         let battery = battery::read();
         battery::subscribe(hwnd);
-        volume::spawn(hwnd);
 
         let app = App {
             hwnd,
@@ -168,6 +182,14 @@ pub fn run() -> Result<()> {
             alert: None,
             volume: Spring::new(0.0),
             notifications: Notifications::spawn(hwnd),
+            bluetooth: Bluetooth::spawn(hwnd),
+            bluetooth_device: None,
+            audio: Volume::spawn(hwnd),
+            controls: Controls::spawn(hwnd),
+            control_state: ControlState::default(),
+            page: Spring::new(0.0),
+            wheel: 0,
+            slider_drag: None,
             obstructed: false,
         };
         APP.with_borrow_mut(|slot| *slot = Some(app));
@@ -325,6 +347,7 @@ impl App {
                 self.lyrics_reveal,
                 self.panel_width,
                 self.volume,
+                self.page,
             ]
             .iter()
             .all(Spring::is_settled)
@@ -339,12 +362,19 @@ impl App {
     }
 
     fn set_hovered(&mut self, hovered: bool) {
-        // Dragging the progress knob past the notch's edge must not close it.
-        if self.hovered == hovered || !hovered && self.seeking.is_some() {
+        // Dragging the progress knob or a slider past the notch's edge must
+        // not close it.
+        let dragging = self.seeking.is_some() || self.slider_drag.is_some();
+        if self.hovered == hovered || !hovered && dragging {
             return;
         }
         self.hovered = hovered;
         self.retarget();
+        if !hovered {
+            // It opens on the player next time, as the island does.
+            self.page = Spring::new(0.0);
+            self.wheel = 0;
+        }
 
         // A notification stays while the pointer rests on it, then gets a
         // short grace period once it leaves.
@@ -391,6 +421,15 @@ impl App {
             self.obstructed = obstructed;
             self.retarget();
         }
+    }
+
+    /// Refreshes the indicator and alerts the latest connect/disconnect.
+    fn on_bluetooth(&mut self) -> Result<()> {
+        self.bluetooth_device = self.bluetooth.primary();
+        if let Some((device, connected)) = self.bluetooth.take_latest_event() {
+            self.show_alert(Alert::Bluetooth { device, connected }, BLUETOOTH_ALERT_MS);
+        }
+        self.invalidate()
     }
 
     fn on_toast(&mut self) -> Result<()> {
@@ -467,6 +506,10 @@ impl App {
 
     /// A volume or mute change from any source.
     fn on_volume(&mut self, percent: u32, muted: bool) -> Result<()> {
+        // The Control Center page already shows it, in its own slider.
+        if self.on_controls_page() {
+            return self.invalidate();
+        }
         let showing = matches!(self.alert, Some((Alert::Volume { .. }, false)));
         if showing {
             // Slide from where the slider is now.
@@ -503,6 +546,7 @@ impl App {
         self.lyrics_reveal.update(dt);
         self.panel_width.update(dt);
         self.volume.update(dt);
+        self.page.update(dt);
         let result = self.redraw();
         if self.transition.as_ref().is_some_and(|(_, start)| start.elapsed() >= TRACK_TRANSITION) {
             self.transition = None;
@@ -533,6 +577,22 @@ impl App {
             },
             LyricsState::Found(l) => LyricsView::Plain(&l.lines),
         };
+        let (mut volume, muted) = self.audio.level();
+        let mut brightness = None;
+        // A dragged slider shows where the pointer is, not the last report.
+        match self.slider_drag {
+            Some((Slider::Volume, v)) => volume = v,
+            Some((Slider::Brightness, v)) => brightness = Some(v),
+            None => {}
+        }
+        let controls = ControlsView {
+            state: self.control_state,
+            volume,
+            muted,
+            brightness,
+            bluetooth_device: self.bluetooth_device.as_ref().map(|d| d.name.as_str()),
+            battery: self.battery,
+        };
         let scene = Scene {
             shape,
             panel_width: self.panel_width.value,
@@ -542,13 +602,92 @@ impl App {
             lyrics,
             seek: self.seeking,
             battery: self.battery,
+            bluetooth: self.bluetooth_device.as_ref().map(|d| d.kind),
             alert: self.alert.as_ref().map(|(alert, _)| match alert {
                 Alert::Volume { muted, .. } => Alert::Volume { level: self.volume.value / 100.0, muted: *muted },
                 other => other.clone(),
             }),
+            page: self.page.value / 100.0,
+            controls,
         };
         render::draw(&mut self.pixmap, self.scale, &scene, self.fonts.as_ref());
         self.surface.present(self.hwnd, &self.pixmap, self.origin)
+    }
+
+    /// Whether the open notch is showing (or turning to) the Control Center.
+    fn on_controls_page(&self) -> bool {
+        self.hovered && self.page.target > 50.0
+    }
+
+    /// Mouse wheel or touchpad scroll: down for Control Center, up for the
+    /// player. Small touchpad steps add up until they make a full notch.
+    fn on_wheel(&mut self, delta: i32) -> Result<()> {
+        const STEP: i32 = 40;
+        let open = self.hovered && self.height.value >= EXPANDED.height * 0.9 && !self.showing_toast();
+        if !open {
+            return Ok(());
+        }
+        self.wheel += delta;
+        let target = if self.wheel <= -STEP {
+            100.0
+        } else if self.wheel >= STEP {
+            0.0
+        } else {
+            return Ok(());
+        };
+        self.wheel = 0;
+        if target != self.page.target {
+            self.start_animation();
+            self.page.target = target;
+            if target > 50.0 {
+                // Radios may have been switched elsewhere since last looked.
+                self.controls.send(ControlCommand::Refresh);
+            }
+        }
+        Ok(())
+    }
+
+    fn on_controls(&mut self) -> Result<()> {
+        self.control_state = self.controls.state();
+        self.invalidate()
+    }
+
+    /// A tap on a Control Center toggle. The tile flips right away; the
+    /// worker's report follows.
+    fn toggle(&mut self, toggle: Toggle) {
+        let s = &mut self.control_state;
+        match toggle {
+            Toggle::Airplane => {
+                let on = !s.airplane();
+                self.controls.send(ControlCommand::SetAirplane(on));
+                s.wifi = s.wifi.map(|_| !on);
+                s.bluetooth = s.bluetooth.map(|_| !on);
+            }
+            Toggle::Wifi => {
+                if let Some(wifi) = s.wifi.as_mut() {
+                    *wifi = !*wifi;
+                    self.controls.send(ControlCommand::SetWifi(*wifi));
+                }
+            }
+            Toggle::Bluetooth => {
+                if let Some(bluetooth) = s.bluetooth.as_mut() {
+                    *bluetooth = !*bluetooth;
+                    self.controls.send(ControlCommand::SetBluetooth(*bluetooth));
+                }
+            }
+            Toggle::Mute => {
+                let (_, muted) = self.audio.level();
+                self.audio.set_mute(!muted);
+            }
+        }
+    }
+
+    fn apply_slider(&mut self, slider: Slider, value: f32) {
+        self.slider_drag = Some((slider, value));
+        match slider {
+            Slider::Brightness => self.controls.send(ControlCommand::SetBrightness((value * 100.0).round() as u8)),
+            Slider::Volume => self.audio.set_level(value),
+        }
     }
 
     /// Moves the lyrics to the line being sung. `snap` jumps there without
@@ -647,8 +786,28 @@ impl App {
         self.now_playing.is_some() && self.height.value >= EXPANDED.height * 0.9
     }
 
-    /// Starts dragging the progress knob if the press is on the bar.
+    /// Where a press on the Control Center page lands, once it is in view.
+    fn control_at(&self, x: f32, y: f32) -> Option<ControlHit> {
+        let settled = self.on_controls_page() && self.page.value > 90.0;
+        let open = self.height.value >= EXPANDED.height * 0.9;
+        if !settled || !open {
+            return None;
+        }
+        render::control_at(self.pixmap.width(), self.scale, self.panel_width.value, (x, y))
+    }
+
+    /// Starts dragging a Control Center slider or the progress knob if the
+    /// press is on one.
     fn on_mouse_down(&mut self, x: f32, y: f32) -> Result<()> {
+        if self.on_controls_page() {
+            if let Some(ControlHit::Slider(slider, value)) = self.control_at(x, y) {
+                self.apply_slider(slider, value);
+                // Keep receiving moves and the release even off the notch.
+                unsafe { SetCapture(self.hwnd) };
+                return self.invalidate();
+            }
+            return Ok(());
+        }
         let has_length = self.now_playing.as_ref().is_some_and(|np| np.timeline.is_some());
         if !self.controls_ready() || !has_length {
             return Ok(());
@@ -662,6 +821,23 @@ impl App {
 
     fn on_seek_move(&mut self, x: f32, y: f32) -> Result<()> {
         self.seeking = self.progress_at((x, y), false);
+        self.invalidate()
+    }
+
+    fn on_slider_move(&mut self, y: f32) -> Result<()> {
+        if let Some((slider, _)) = self.slider_drag {
+            self.apply_slider(slider, render::slider_value(self.scale, y));
+        }
+        self.invalidate()
+    }
+
+    fn finish_slider(&mut self) -> Result<()> {
+        // Cleared before releasing, so the capture change is not a cancel.
+        self.slider_drag = None;
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        self.rearm_mouse_leave();
         self.invalidate()
     }
 
@@ -705,6 +881,13 @@ impl App {
         if let Some((Alert::Toast(toast), false)) = &self.alert {
             toast.open_app();
             self.end_alert();
+            return Ok(());
+        }
+        if self.on_controls_page() {
+            if let Some(ControlHit::Toggle(toggle)) = self.control_at(x, y) {
+                self.toggle(toggle);
+                return self.invalidate();
+            }
             return Ok(());
         }
         if !self.controls_ready() {
@@ -788,6 +971,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             let result = with_app(|app| {
                 if app.seeking.is_some() {
                     app.on_seek_move(x, y)
+                } else if app.slider_drag.is_some() {
+                    app.on_slider_move(y)
                 } else {
                     app.set_hovered(true);
                     Ok(())
@@ -812,7 +997,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_LBUTTONUP => {
             let (x, y) = mouse_pos(lparam);
             let result = with_app(|app| {
-                if app.seeking.is_some() { app.finish_seek() } else { app.on_click(x, y) }
+                if app.seeking.is_some() {
+                    app.finish_seek()
+                } else if app.slider_drag.is_some() {
+                    app.finish_slider()
+                } else {
+                    app.on_click(x, y)
+                }
             });
             if let Some(Err(e)) = result {
                 eprintln!("click failed: {e}");
@@ -820,10 +1011,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         // Capture taken away mid-drag (Alt+Tab, a dialog...): drop the drag
-        // without seeking. Our own release clears `seeking` first.
+        // without seeking; a slider keeps the value it was dragged to. Our
+        // own releases clear the drag state first.
         WM_CAPTURECHANGED => {
             let result = with_app(|app| {
-                if app.seeking.take().is_some() {
+                let slider = app.slider_drag.take().is_some();
+                if app.seeking.take().is_some() || slider {
                     app.rearm_mouse_leave();
                     app.invalidate()
                 } else {
@@ -832,6 +1025,20 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             });
             if let Some(Err(e)) = result {
                 eprintln!("seek cancel failed: {e}");
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            // High word of wparam: signed wheel travel, 120 per mouse notch.
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            if let Some(Err(e)) = with_app(|app| app.on_wheel(delta)) {
+                eprintln!("page change failed: {e}");
+            }
+            LRESULT(0)
+        }
+        WM_CONTROLS => {
+            if let Some(Err(e)) = with_app(App::on_controls) {
+                eprintln!("controls redraw failed: {e}");
             }
             LRESULT(0)
         }
@@ -845,6 +1052,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             let (percent, muted) = (wparam.0 as u32, lparam.0 != 0);
             if let Some(Err(e)) = with_app(|app| app.on_volume(percent, muted)) {
                 eprintln!("volume redraw failed: {e}");
+            }
+            LRESULT(0)
+        }
+        WM_BLUETOOTH => {
+            if let Some(Err(e)) = with_app(App::on_bluetooth) {
+                eprintln!("bluetooth redraw failed: {e}");
             }
             LRESULT(0)
         }

@@ -9,12 +9,14 @@ use std::time::Duration;
 
 use fontdue::{Font, FontSettings, Metrics};
 use tiny_skia::{
-    Color, FillRule, FilterQuality, GradientStop, LineCap, LinearGradient, Mask, Paint, Path,
-    PathBuilder, Pattern, Pixmap, Point, Rect, SpreadMode, Stroke, Transform,
+    Color, FillRule, FilterQuality, GradientStop, LineCap, LineJoin, LinearGradient, Mask, Paint,
+    Path, PathBuilder, Pattern, Pixmap, Point, Rect, SpreadMode, Stroke, Transform,
 };
 
 use crate::anim::{ease_out_back, ease_out_cubic};
 use crate::battery::{Battery, BatteryEvent};
+use crate::bluetooth::{Device, DeviceKind};
+use crate::controls::ControlState;
 use crate::lyrics::Line;
 use crate::media::{art_changed, track_changed, Command, NowPlaying};
 use crate::notifications::Toast;
@@ -45,11 +47,15 @@ pub const TOAST_ALERT: Shape = Shape { width: 400.0, height: 84.0, radius: 30.0 
 /// stays out of the way of title bars and tabs.
 pub const MINI: Shape = Shape { width: 80.0, height: 10.0, radius: 5.0 };
 
+/// A Bluetooth device connecting or disconnecting.
+pub const BLUETOOTH_ALERT: Shape = Shape { width: 340.0, height: 40.0, radius: 18.0 };
+
 pub fn alert_shape(alert: &Alert) -> Shape {
     match alert {
         Alert::Battery { .. } => BATTERY_ALERT,
         Alert::Volume { .. } => VOLUME_ALERT,
         Alert::Toast(_) => TOAST_ALERT,
+        Alert::Bluetooth { .. } => BLUETOOTH_ALERT,
     }
 }
 
@@ -172,7 +178,48 @@ pub struct Scene<'a> {
     pub seek: Option<f32>,
     /// `None` on machines without a battery.
     pub battery: Option<Battery>,
+    /// The kind of Bluetooth device the resting notch shows, if any is
+    /// connected.
+    pub bluetooth: Option<DeviceKind>,
     pub alert: Option<Alert>,
+    /// Open notch page, animated: 0 = player, 1 = Control Center.
+    pub page: f32,
+    pub controls: ControlsView<'a>,
+}
+
+/// What the Control Center page shows.
+#[derive(Clone, Copy, Default)]
+pub struct ControlsView<'a> {
+    pub state: ControlState,
+    /// 0..1.
+    pub volume: f32,
+    pub muted: bool,
+    /// 0..1, overriding the reported brightness while its slider is dragged.
+    pub brightness: Option<f32>,
+    pub bluetooth_device: Option<&'a str>,
+    pub battery: Option<Battery>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Toggle {
+    Airplane,
+    Wifi,
+    Bluetooth,
+    Mute,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Slider {
+    Brightness,
+    Volume,
+}
+
+/// Something under the pointer on the Control Center page.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ControlHit {
+    Toggle(Toggle),
+    /// With the value (0..1) at the pointer.
+    Slider(Slider, f32),
 }
 
 /// A brief notification, shown in its `alert_shape`.
@@ -183,6 +230,7 @@ pub enum Alert {
     Volume { level: f32, muted: bool },
     /// A toast from another app (WhatsApp, mail...).
     Toast(Arc<Toast>),
+    Bluetooth { device: Device, connected: bool },
 }
 
 pub enum LyricsView<'a> {
@@ -339,7 +387,7 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
     let Some(mut clip) = Mask::new(pixmap.width(), pixmap.height()) else { return };
     clip.fill_path(&path, FillRule::Winding, true, ts);
 
-    let mut canvas = Canvas { pixmap, clip: &clip, scale, fonts };
+    let mut canvas = Canvas { pixmap, clip: &clip, scale, fonts, dy: 0.0 };
     let (left, right) = ((canvas_w - shape.width) / 2.0, (canvas_w + shape.width) / 2.0);
 
     // The resting content fades out as the notch shrinks into its mini pill.
@@ -347,7 +395,7 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
     let unshrunk = ((shape.width - MINI.width) / (rest_width - MINI.width)).clamp(0.0, 1.0);
     let collapsed_alpha = (1.0 - t * 3.0).clamp(0.0, 1.0) * (1.0 - alert_alpha) * unshrunk * unshrunk;
     if collapsed_alpha > 0.0 {
-        canvas.collapsed(media, transition, scene.battery, left, right, collapsed_alpha);
+        canvas.collapsed(media, transition, scene.battery, scene.bluetooth, left, right, collapsed_alpha);
     }
 
     if let Some(alert) = scene.alert.as_ref().filter(|_| alert_alpha > 0.0) {
@@ -356,7 +404,21 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
 
     if expanded_alpha > 0.0 {
         let layout = Layout::new(canvas_w, scene.panel_width, scene.lyrics_reveal);
-        canvas.expanded(media, transition, &scene.lyrics, scene.seek, layout, expanded_alpha);
+        // Pages slide vertically past each other, like Control Center's.
+        // The old one is mostly gone before the new one shows, so the two
+        // barely overlap.
+        let p = scene.page.clamp(0.0, 1.0);
+        let (out_alpha, in_alpha) = (((0.6 - p) / 0.6).clamp(0.0, 1.0), ((p - 0.4) / 0.6).clamp(0.0, 1.0));
+        if out_alpha > 0.0 {
+            canvas.dy = -p * PAGE_SLIDE;
+            canvas.expanded(media, transition, &scene.lyrics, scene.seek, layout, expanded_alpha * out_alpha);
+        }
+        if in_alpha > 0.0 {
+            canvas.dy = (1.0 - p) * PAGE_SLIDE;
+            canvas.control_center(&scene.controls, layout.left, layout.width, expanded_alpha * in_alpha);
+        }
+        canvas.dy = 0.0;
+        canvas.page_dots(layout.left + layout.width - 10.0, p, expanded_alpha);
     }
 }
 
@@ -439,6 +501,64 @@ pub fn button_at(
     .into_iter()
     .find(|&(_, cx)| (x - left - cx).hypot(y - CONTROLS_Y) <= BUTTON_HIT_RADIUS)
     .map(|(button, _)| button)
+}
+
+/// How far (logical px) a page travels while sliding in or out.
+const PAGE_SLIDE: f32 = 36.0;
+
+// Control Center layout, relative to the open notch's left edge: a
+// connectivity platter with four round toggles, two tall sliders, and an
+// info platter in what width remains.
+const CC_TOP: f32 = 12.0;
+const CC_HEIGHT: f32 = 126.0;
+const PLATTER_X: f32 = 16.0;
+const PLATTER: f32 = 126.0;
+const TOGGLE_RADIUS: f32 = 23.0;
+const SLIDER_W: f32 = 52.0;
+const BRIGHTNESS_X: f32 = 156.0;
+const VOLUME_X: f32 = 220.0;
+const INFO_X: f32 = 286.0;
+/// Narrower than this, the info platter is left out.
+const INFO_MIN_W: f32 = 90.0;
+
+const ORANGE: Rgb = [255, 159, 10];
+const BLUE: Rgb = [10, 132, 255];
+
+/// Toggles in the platter's 2x2 grid, with their centers.
+fn toggles() -> [(Toggle, f32, f32); 4] {
+    let (a, b) = (PLATTER_X + 35.0, PLATTER_X + 91.0);
+    let (top, bottom) = (CC_TOP + 35.0, CC_TOP + 91.0);
+    [
+        (Toggle::Airplane, a, top),
+        (Toggle::Mute, b, top),
+        (Toggle::Wifi, a, bottom),
+        (Toggle::Bluetooth, b, bottom),
+    ]
+}
+
+/// What on the Control Center page is under a point in physical canvas
+/// pixels.
+pub fn control_at(canvas_width: u32, scale: f32, panel_width: f32, (x, y): (f32, f32)) -> Option<ControlHit> {
+    let left = (canvas_width as f32 / scale - panel_width) / 2.0;
+    let (x, y) = (x / scale - left, y / scale);
+    if let Some((toggle, _, _)) = toggles().into_iter().find(|&(_, cx, cy)| (x - cx).hypot(y - cy) <= TOGGLE_RADIUS) {
+        return Some(ControlHit::Toggle(toggle));
+    }
+    let in_column = |x0: f32| x >= x0 && x <= x0 + SLIDER_W && y >= CC_TOP && y <= CC_TOP + CC_HEIGHT;
+    let slider = if in_column(BRIGHTNESS_X) {
+        Slider::Brightness
+    } else if in_column(VOLUME_X) {
+        Slider::Volume
+    } else {
+        return None;
+    };
+    Some(ControlHit::Slider(slider, slider_value(scale, y * scale)))
+}
+
+/// A slider's value (0..1) at a physical y, clamped; for dragging past
+/// either end.
+pub fn slider_value(scale: f32, y: f32) -> f32 {
+    (1.0 - (y / scale - CC_TOP) / CC_HEIGHT).clamp(0.0, 1.0)
 }
 
 /// Where along the progress bar (0..1) a point in physical canvas pixels
@@ -524,21 +644,266 @@ struct Canvas<'a> {
     clip: &'a Mask,
     scale: f32,
     fonts: Option<&'a Fonts>,
+    /// Vertical offset (logical px) for everything drawn; slides pages.
+    dy: f32,
 }
 
 impl Canvas<'_> {
+    /// Logical to physical pixels, with the page offset.
+    fn transform(&self) -> Transform {
+        Transform::from_row(self.scale, 0.0, 0.0, self.scale, 0.0, self.dy * self.scale)
+    }
+
+    /// The Control Center page: connectivity platter, brightness and volume
+    /// sliders, and an info platter if there is room.
+    fn control_center(&mut self, view: &ControlsView, left: f32, width: f32, alpha: f32) {
+        // Translucent "platters", as in Control Center.
+        if let Some(platter) = rounded_rect(left + PLATTER_X, CC_TOP, PLATTER, CC_HEIGHT, 28.0) {
+            self.fill(&platter, WHITE, alpha * 0.10);
+        }
+        let s = view.state;
+        for (toggle, cx, cy) in toggles() {
+            let (on, available, color) = match toggle {
+                Toggle::Airplane => (s.airplane(), s.wifi.is_some() || s.bluetooth.is_some(), ORANGE),
+                Toggle::Wifi => (s.wifi == Some(true), s.wifi.is_some(), BLUE),
+                Toggle::Bluetooth => (s.bluetooth == Some(true), s.bluetooth.is_some(), BLUE),
+                Toggle::Mute => (view.muted, true, RED),
+            };
+            let a = alpha * if available { 1.0 } else { 0.4 };
+            if let Some(circle) = PathBuilder::from_circle(left + cx, cy, TOGGLE_RADIUS) {
+                if on {
+                    self.fill(&circle, color, a);
+                } else {
+                    self.fill(&circle, WHITE, a * 0.18);
+                }
+            }
+            let (x, y) = (left + cx, cy);
+            match toggle {
+                Toggle::Airplane => self.airplane_icon(x, y, a),
+                Toggle::Wifi => self.wifi_icon(x, y + 1.0, a),
+                Toggle::Bluetooth => self.device_icon(DeviceKind::Other, x, y, a),
+                Toggle::Mute => self.speaker_icon(x - 6.0, y, if view.muted { 0.0 } else { 1.0 }, view.muted, a),
+            }
+        }
+
+        let brightness = view.brightness.or(s.brightness.map(|b| b as f32 / 100.0));
+        self.slider(left + BRIGHTNESS_X, brightness, Slider::Brightness, false, alpha);
+        self.slider(left + VOLUME_X, Some(view.volume), Slider::Volume, view.muted, alpha);
+
+        let info_w = width - INFO_X - 16.0;
+        if info_w >= INFO_MIN_W {
+            self.info_platter(view, left + INFO_X, info_w, alpha);
+        }
+    }
+
+    /// A tall capsule that fills from the bottom, its symbol at the foot.
+    /// `None` (no software brightness) draws it empty and dimmed.
+    fn slider(&mut self, x: f32, value: Option<f32>, kind: Slider, muted: bool, alpha: f32) {
+        let Some(capsule) = rounded_rect(x, CC_TOP, SLIDER_W, CC_HEIGHT, 24.0) else { return };
+        let alpha = alpha * if value.is_some() { 1.0 } else { 0.4 };
+        self.fill(&capsule, WHITE, alpha * 0.16);
+
+        let v = value.unwrap_or(0.0).clamp(0.0, 1.0);
+        let level_h = CC_HEIGHT * v;
+        if level_h > 0.5 {
+            // The level has a straight top edge, clipped to the capsule.
+            let top = CC_TOP + CC_HEIGHT - level_h;
+            if let Some(level) = Rect::from_xywh(x, top, SLIDER_W, level_h) {
+                self.fill_within(&PathBuilder::from_rect(level), &capsule, WHITE, alpha * 0.95);
+            }
+        }
+
+        // The symbol turns dark once the white level covers it.
+        let (cx, cy) = (x + SLIDER_W / 2.0, CC_TOP + CC_HEIGHT - 20.0);
+        let covered = level_h > 30.0;
+        let a = alpha * if covered { 0.75 } else { 1.0 };
+        match kind {
+            Slider::Brightness => self.sun_icon(cx, cy, covered, a),
+            Slider::Volume if covered => self.dark_speaker(cx - 6.0, cy, v, muted, a),
+            Slider::Volume => self.speaker_icon(cx - 6.0, cy, v, muted, a),
+        }
+    }
+
+    /// `speaker_icon` in near-black, for on top of a white slider level.
+    fn dark_speaker(&mut self, x: f32, cy: f32, level: f32, muted: bool, alpha: f32) {
+        // Drawn into a scratch layer, then tinted: the speaker paths are
+        // white-only, and this keeps them in one place.
+        let Some(mut layer) = Pixmap::new(self.pixmap.width(), self.pixmap.height()) else { return };
+        let mut scratch = Canvas { pixmap: &mut layer, clip: self.clip, scale: self.scale, fonts: self.fonts, dy: self.dy };
+        scratch.speaker_icon(x, cy, level, muted, 1.0);
+        for px in layer.data_mut().chunks_exact_mut(4) {
+            // Premultiplied white becomes premultiplied near-black.
+            let a = px[3] as f32 / 255.0;
+            let dark = (40.0 * a) as u8;
+            px[0] = dark;
+            px[1] = dark;
+            px[2] = dark;
+        }
+        let paint = tiny_skia::PixmapPaint { opacity: alpha, ..Default::default() };
+        self.pixmap.draw_pixmap(0, 0, layer.as_ref(), &paint, Transform::identity(), None);
+    }
+
+    /// Wi-Fi, Bluetooth and battery, one row each.
+    fn info_platter(&mut self, view: &ControlsView, x: f32, w: f32, alpha: f32) {
+        let Some(fonts) = self.fonts else { return };
+        if let Some(platter) = rounded_rect(x, CC_TOP, w, CC_HEIGHT, 24.0) {
+            self.fill(&platter, WHITE, alpha * 0.10);
+        }
+        let on_off = |v: Option<bool>| match v {
+            Some(true) => "On",
+            Some(false) => "Off",
+            None => "Unavailable",
+        };
+        let bluetooth = match (view.state.bluetooth, view.bluetooth_device) {
+            (Some(true), Some(device)) => device.to_owned(),
+            (state, _) => on_off(state).to_owned(),
+        };
+        let battery = view.battery.map(|b| {
+            let status = if b.plugged && b.charging {
+                " · Charging"
+            } else if b.plugged {
+                " · Plugged in"
+            } else {
+                ""
+            };
+            format!("{}%{status}", b.percent)
+        });
+
+        let rows: [(&str, String); 3] = [
+            ("Wi-Fi", on_off(view.state.wifi).to_owned()),
+            ("Bluetooth", bluetooth),
+            ("Battery", battery.unwrap_or_else(|| "—".to_owned())),
+        ];
+        let row_h = CC_HEIGHT / 3.0;
+        for (i, (label, detail)) in rows.iter().enumerate() {
+            let mid = CC_TOP + row_h * (i as f32 + 0.5);
+            let icon_x = x + 22.0;
+            match i {
+                0 => self.wifi_icon(icon_x, mid + 1.0, alpha),
+                1 => self.device_icon(DeviceKind::Other, icon_x, mid, alpha),
+                _ => {
+                    if let Some(b) = view.battery {
+                        self.battery_glyph(icon_x - 10.0, mid - 4.5, 9.0, Battery { plugged: false, ..b }, alpha);
+                    }
+                }
+            }
+            let text_x = x + 40.0;
+            let max = w - 40.0 - 12.0;
+            self.text(&fonts.semibold, label, 12.5, text_x, mid - 2.0, max, WHITE, alpha);
+            self.text(&fonts.regular, detail, 11.5, text_x, mid + 12.0, max, GRAY, alpha);
+        }
+    }
+
+    /// Two vertical dots on the right edge, the current page's bright.
+    fn page_dots(&mut self, x: f32, page: f32, alpha: f32) {
+        for (i, y) in [70.0, 80.0].into_iter().enumerate() {
+            // Brightness follows the slide, so the dots cross over with it.
+            let current = if i == 0 { 1.0 - page } else { page };
+            if let Some(dot) = PathBuilder::from_circle(x, y, 2.5) {
+                self.fill(&dot, WHITE, alpha * (0.3 + 0.6 * current));
+            }
+        }
+    }
+
+    /// Fills `path` clipped to `within` as well as to the notch.
+    fn fill_within(&mut self, path: &Path, within: &Path, rgb: Rgb, alpha: f32) {
+        let Some(mut mask) = Mask::new(self.pixmap.width(), self.pixmap.height()) else { return };
+        mask.fill_path(within, FillRule::Winding, true, self.transform());
+        for (m, c) in mask.data_mut().iter_mut().zip(self.clip.data()) {
+            *m = ((*m as u16 * *c as u16) / 255) as u8;
+        }
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_rgba8(rgb[0], rgb[1], rgb[2], (alpha * 255.0) as u8));
+        paint.anti_alias = true;
+        self.pixmap.fill_path(path, &paint, FillRule::Winding, self.transform(), Some(&mask));
+    }
+
+    /// SF-style airplane, nose up, about 15 px tall.
+    fn airplane_icon(&mut self, cx: f32, cy: f32, alpha: f32) {
+        let half = [
+            (0.0, -7.6),
+            (1.4, -6.0),
+            (1.4, -1.8),
+            (7.4, 1.9),
+            (7.4, 3.4),
+            (1.4, 1.8),
+            (1.4, 4.9),
+            (3.5, 6.5),
+            (3.5, 7.6),
+            (0.0, 6.7),
+        ];
+        let mut pb = PathBuilder::new();
+        // Right half going down, then mirrored back up the left side.
+        let outline = half.iter().copied().chain(half.iter().rev().skip(1).map(|&(x, y)| (-x, y)));
+        for (i, (x, y)) in outline.enumerate() {
+            if i == 0 { pb.move_to(cx + x, cy + y) } else { pb.line_to(cx + x, cy + y) }
+        }
+        pb.close();
+        if let Some(path) = pb.finish() {
+            self.fill(&path, WHITE, alpha);
+        }
+    }
+
+    /// Three arcs over a dot.
+    fn wifi_icon(&mut self, cx: f32, cy: f32, alpha: f32) {
+        let base = cy + 5.0;
+        for r in [4.0, 7.5, 11.0] {
+            // Upward 90° arc; quadratic control point at r / cos(45°).
+            let d = r * std::f32::consts::FRAC_1_SQRT_2;
+            let mut pb = PathBuilder::new();
+            pb.move_to(cx - d, base - d);
+            pb.quad_to(cx, base - r * std::f32::consts::SQRT_2, cx + d, base - d);
+            if let Some(arc) = pb.finish() {
+                self.stroke(&arc, 1.8, WHITE, alpha);
+            }
+        }
+        if let Some(dot) = PathBuilder::from_circle(cx, base, 1.6) {
+            self.fill(&dot, WHITE, alpha);
+        }
+    }
+
+    /// A sun: disc and eight rays. Dark when on a white slider level.
+    fn sun_icon(&mut self, cx: f32, cy: f32, dark: bool, alpha: f32) {
+        let rgb = if dark { [40, 40, 40] } else { WHITE };
+        if let Some(disc) = PathBuilder::from_circle(cx, cy, 3.4) {
+            self.fill(&disc, rgb, alpha);
+        }
+        let mut pb = PathBuilder::new();
+        for i in 0..8 {
+            let angle = i as f32 * std::f32::consts::FRAC_PI_4;
+            let (sin, cos) = angle.sin_cos();
+            pb.move_to(cx + cos * 5.6, cy + sin * 5.6);
+            pb.line_to(cx + cos * 7.6, cy + sin * 7.6);
+        }
+        if let Some(rays) = pb.finish() {
+            self.stroke(&rays, 1.5, rgb, alpha);
+        }
+    }
+
     /// Mini art and equalizer bars; the battery, if any, takes the right
-    /// side and pushes the equalizer next to the art.
+    /// side and pushes the equalizer next to the art. A connected Bluetooth
+    /// device's icon sits just left of whatever is rightmost.
+    #[allow(clippy::too_many_arguments)]
     fn collapsed(
         &mut self,
         media: Option<&NowPlaying>,
         transition: Option<&Transition>,
         battery: Option<Battery>,
+        bluetooth: Option<DeviceKind>,
         left: f32,
         right: f32,
         alpha: f32,
     ) {
         let mid = COLLAPSED.height / 2.0;
+        if let Some(kind) = bluetooth {
+            let rightmost_left = match battery {
+                Some(b) => right - 14.0 - Self::battery_glyph_width(13.0, b.plugged),
+                // Without a battery the equalizer is the rightmost item.
+                None if media.is_some() => right - 27.0,
+                None => right - 5.0,
+            };
+            self.device_icon(kind, rightmost_left - 9.0 - 7.0, mid, alpha * 0.9);
+        }
         for (slot, phase) in slots(media, transition, art_changed) {
             if let Some(art) = slot.and_then(|np| np.art.as_ref()) {
                 self.art(&art.pixmap, left + 12.0, mid - 10.0, 20.0, 5.0, alpha * phase.alpha, phase.zoom);
@@ -571,6 +936,91 @@ impl Canvas<'_> {
             Alert::Battery { event, battery } => self.battery_alert(*event, *battery, left, right, alpha),
             Alert::Volume { level, muted } => self.volume_alert(*level, *muted, left, right, alpha),
             Alert::Toast(toast) => self.toast_alert(toast, left, right, alpha),
+            Alert::Bluetooth { device, connected } => self.bluetooth_alert(device, *connected, left, right, alpha),
+        }
+    }
+
+    /// Device icon and name on the left, "Connected"/"Disconnected" on the right.
+    fn bluetooth_alert(&mut self, device: &Device, connected: bool, left: f32, right: f32, alpha: f32) {
+        let Some(fonts) = self.fonts else { return };
+        let mid = BLUETOOTH_ALERT.height / 2.0;
+        self.device_icon(device.kind, left + 27.0, mid, alpha);
+
+        let (status, color) = if connected { ("Connected", GREEN) } else { ("Disconnected", GRAY) };
+        let status_right = right - 20.0;
+        self.text_right(&fonts.semibold, status, 13.0, status_right, mid + 4.5, color, alpha);
+
+        let x = left + 44.0;
+        let status_w = text_width(&fonts.semibold, status, 13.0 * self.scale) / self.scale;
+        let max = status_right - status_w - 12.0 - x;
+        self.text(&fonts.semibold, &device.name, 13.5, x, mid + 4.5, max, WHITE, alpha);
+    }
+
+    /// A small line icon for the device's kind, about 14 px, centered on
+    /// (cx, cy). Unknown kinds get the Bluetooth rune.
+    fn device_icon(&mut self, kind: DeviceKind, cx: f32, cy: f32, alpha: f32) {
+        let mut pb = PathBuilder::new();
+        match kind {
+            DeviceKind::Headphones => {
+                // Headband: a half circle drawn as two quarter arcs.
+                let (r, y) = (5.5, cy + 1.0);
+                let k = r * KAPPA;
+                pb.move_to(cx - r, y);
+                pb.cubic_to(cx - r, y - k, cx - k, y - r, cx, y - r);
+                pb.cubic_to(cx + k, y - r, cx + r, y - k, cx + r, y);
+                if let Some(band) = pb.finish() {
+                    self.stroke(&band, 1.6, WHITE, alpha);
+                }
+                for x in [cx - r - 1.3, cx + r - 1.9] {
+                    if let Some(cup) = rounded_rect(x, y - 0.5, 3.2, 6.0, 1.3) {
+                        self.fill(&cup, WHITE, alpha);
+                    }
+                }
+                return;
+            }
+            DeviceKind::Keyboard => {
+                if let Some(body) = rounded_rect(cx - 7.0, cy - 4.5, 14.0, 9.0, 2.0) {
+                    pb.push_path(&body);
+                }
+                if let Some(path) = pb.finish() {
+                    self.stroke(&path, 1.3, WHITE, alpha);
+                }
+                for i in 0..4 {
+                    let x = cx - 4.6 + i as f32 * 2.6;
+                    if let Some(key) = rounded_rect(x, cy - 2.0, 1.6, 1.6, 0.4) {
+                        self.fill(&key, WHITE, alpha);
+                    }
+                }
+                if let Some(space) = rounded_rect(cx - 3.0, cy + 1.2, 6.0, 1.5, 0.5) {
+                    self.fill(&space, WHITE, alpha);
+                }
+                return;
+            }
+            DeviceKind::Mouse => {
+                if let Some(body) = rounded_rect(cx - 4.0, cy - 6.5, 8.0, 13.0, 4.0) {
+                    pb.push_path(&body);
+                }
+                pb.move_to(cx, cy - 6.5);
+                pb.line_to(cx, cy - 2.5);
+            }
+            DeviceKind::Phone => {
+                if let Some(body) = rounded_rect(cx - 4.0, cy - 7.0, 8.0, 14.0, 2.0) {
+                    pb.push_path(&body);
+                }
+                pb.move_to(cx - 1.3, cy + 4.6);
+                pb.line_to(cx + 1.3, cy + 4.6);
+            }
+            DeviceKind::Other => {
+                pb.move_to(cx - 3.5, cy - 3.5);
+                pb.line_to(cx + 3.5, cy + 3.2);
+                pb.line_to(cx, cy + 6.8);
+                pb.line_to(cx, cy - 6.8);
+                pb.line_to(cx + 3.5, cy - 3.2);
+                pb.line_to(cx - 3.5, cy + 3.5);
+            }
+        }
+        if let Some(path) = pb.finish() {
+            self.stroke(&path, 1.4, WHITE, alpha);
         }
     }
 
@@ -651,7 +1101,7 @@ impl Canvas<'_> {
             let mut paint = Paint::default();
             paint.set_color(Color::from_rgba8(255, 255, 255, (alpha * 255.0) as u8));
             paint.anti_alias = true;
-            let ts = Transform::from_scale(self.scale, self.scale);
+            let ts = self.transform();
             self.pixmap.fill_path(&speaker, &paint, FillRule::Winding, ts, Some(self.clip));
         }
 
@@ -694,8 +1144,8 @@ impl Canvas<'_> {
         let mut paint = Paint::default();
         paint.set_color(Color::from_rgba8(rgb[0], rgb[1], rgb[2], (alpha * 255.0) as u8));
         paint.anti_alias = true;
-        let stroke = Stroke { width, line_cap: LineCap::Round, ..Default::default() };
-        let ts = Transform::from_scale(self.scale, self.scale);
+        let stroke = Stroke { width, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Default::default() };
+        let ts = self.transform();
         self.pixmap.stroke_path(path, &paint, &stroke, ts, Some(self.clip));
     }
 
@@ -948,7 +1398,7 @@ impl Canvas<'_> {
         let mut paint = Paint::default();
         paint.set_color(Color::from_rgba8(rgb[0], rgb[1], rgb[2], (alpha * 255.0) as u8));
         paint.anti_alias = true;
-        let ts = Transform::from_scale(self.scale, self.scale);
+        let ts = self.transform();
         self.pixmap.fill_path(path, &paint, FillRule::EvenOdd, ts, Some(self.clip));
     }
 
@@ -971,7 +1421,7 @@ impl Canvas<'_> {
             anti_alias: true,
             ..Default::default()
         };
-        let ts = Transform::from_scale(self.scale, self.scale);
+        let ts = self.transform();
         self.pixmap.fill_path(&path, &paint, FillRule::Winding, ts, Some(self.clip));
     }
 
@@ -1055,7 +1505,7 @@ impl Canvas<'_> {
     ) {
         let px = size * self.scale;
         let text = ellipsize(font, text, px, max_width * self.scale);
-        let baseline = (baseline * self.scale).round();
+        let baseline = ((baseline + self.dy) * self.scale).round();
         let mut pen = x * self.scale;
         for ch in text.chars() {
             let glyph = match self.fonts {
@@ -1183,7 +1633,10 @@ mod tests {
                 lyrics: LyricsView::Synced { lines: &lines, scroll: 1.0 },
                 seek: None,
                 battery: Some(charging),
+                bluetooth: None,
                 alert: None,
+                page: 0.0,
+                controls: ControlsView::default(),
             },
             "preview.png",
         );
@@ -1203,10 +1656,40 @@ mod tests {
                 lyrics: LyricsView::Missing,
                 seek: Some(0.6),
                 battery: Some(on_battery),
+                bluetooth: None,
                 alert: None,
+                page: 0.0,
+                controls: ControlsView::default(),
             },
             "preview_player.png",
         );
+
+        // Control Center: full width, player-only width, and mid-slide.
+        let controls = ControlsView {
+            state: ControlState { wifi: Some(true), bluetooth: Some(true), brightness: Some(70) },
+            volume: 0.45,
+            muted: false,
+            brightness: None,
+            bluetooth_device: Some("Galaxy Buds2 Pro"),
+            battery: Some(charging),
+        };
+        let page = |width: f32, page: f32| Scene {
+            shape: Shape { width, ..EXPANDED },
+            panel_width: width,
+            lyrics_reveal: if width == EXPANDED.width { 1.0 } else { 0.0 },
+            media: Some(&np),
+            transition: None,
+            lyrics: LyricsView::Missing,
+            seek: None,
+            battery: Some(charging),
+            bluetooth: None,
+            alert: None,
+            page,
+            controls,
+        };
+        save_preview(&page(EXPANDED.width, 1.0), "preview_controls.png");
+        save_preview(&page(PLAYER_ONLY_WIDTH, 1.0), "preview_controls_narrow.png");
+        save_preview(&page(EXPANDED.width, 0.5), "preview_controls_sliding.png");
 
         // The resting notch with the battery indicator, then the alerts.
         let small = |shape: Shape, battery: Battery, alert: Option<Alert>| Scene {
@@ -1218,10 +1701,16 @@ mod tests {
             lyrics: LyricsView::Missing,
             seek: None,
             battery: Some(battery),
+            bluetooth: Some(DeviceKind::Headphones),
             alert,
+            page: 0.0,
+            controls: ControlsView::default(),
         };
         let rest = Shape { width: COLLAPSED_BATTERY_WIDTH, ..COLLAPSED };
         save_preview(&small(rest, on_battery, None), "preview_collapsed.png");
+        let buds = Device { name: "Galaxy Buds2 Pro".into(), kind: DeviceKind::Headphones };
+        let connected = Alert::Bluetooth { device: buds, connected: true };
+        save_preview(&small(BLUETOOTH_ALERT, on_battery, Some(connected)), "preview_bluetooth.png");
         let plugged_in = Alert::Battery { event: BatteryEvent::PluggedIn, battery: charging };
         save_preview(&small(BATTERY_ALERT, charging, Some(plugged_in)), "preview_alert.png");
         let volume = Alert::Volume { level: 0.6, muted: false };
@@ -1244,6 +1733,20 @@ mod tests {
         save_preview(&small(TOAST_ALERT, on_battery, Some(toast)), "preview_toast.png");
         // A window under the notch: the mini pill, content faded out.
         save_preview(&small(MINI, on_battery, None), "preview_mini.png");
+
+        // Every device icon side by side, on a black strip.
+        let scale = 4.0;
+        let mut strip = Pixmap::new((120.0 * scale) as u32, (30.0 * scale) as u32).unwrap();
+        strip.fill(Color::BLACK);
+        let mut clip = Mask::new(strip.width(), strip.height()).unwrap();
+        clip.data_mut().fill(255);
+        let fonts = Fonts::load();
+        let mut canvas = Canvas { pixmap: &mut strip, clip: &clip, scale, fonts: fonts.as_ref(), dy: 0.0 };
+        let kinds = [DeviceKind::Headphones, DeviceKind::Keyboard, DeviceKind::Mouse, DeviceKind::Phone, DeviceKind::Other];
+        for (i, kind) in kinds.into_iter().enumerate() {
+            canvas.device_icon(kind, 14.0 + i as f32 * 23.0, 15.0, 1.0);
+        }
+        strip.save_png(format!("{}/target/preview_device_icons.png", env!("CARGO_MANIFEST_DIR"))).unwrap();
     }
 }
 
