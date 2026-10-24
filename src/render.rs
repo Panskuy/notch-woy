@@ -85,11 +85,13 @@ const TITLE_SIZE: f32 = 14.5;
 const SUBTITLE_SIZE: f32 = 12.5;
 const TITLE_BASELINE: f32 = 50.0;
 const SUBTITLE_BASELINE: f32 = 66.0;
-const TIME_BASELINE: f32 = 96.0;
 const TIME_LEFT: f32 = 24.0;
 /// Remaining time's right edge, from the player's right edge.
 const TIME_RIGHT_INSET: f32 = 15.0;
 const PROGRESS_Y: f32 = 91.0;
+/// Progress bar thickness, and how much thicker it gets while dragged.
+const PROGRESS_H: f32 = 6.0;
+const PROGRESS_GROW: f32 = 5.0;
 const PROGRESS_X0: f32 = 76.0;
 /// Progress bar's right end, from the player's right edge.
 const PROGRESS_RIGHT_INSET: f32 = 66.0;
@@ -202,6 +204,8 @@ pub struct Scene<'a> {
     pub lyrics: LyricsView<'a>,
     /// Progress bar position (0..1) while its knob is being dragged.
     pub seek: Option<f32>,
+    /// How far the progress bar has swelled for a drag, 0..1 (springy).
+    pub seek_grow: f32,
     /// `None` on machines without a battery.
     pub battery: Option<Battery>,
     /// The kind of Bluetooth device the resting notch shows, if any is
@@ -570,7 +574,7 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
             // The player dims away behind the sheet growing over it.
             let fade = (1.0 - picker * 1.3).clamp(0.0, 1.0);
             if fade > 0.0 {
-                canvas.expanded(media, transition, &scene.lyrics, scene.seek, layout, a * fade);
+                canvas.expanded(media, transition, &scene.lyrics, scene.seek, scene.seek_grow, layout, a * fade);
             }
             if scene.outputs.reveal > 0.001 {
                 canvas.output_picker(&scene.outputs, layout, a);
@@ -1800,6 +1804,7 @@ impl Canvas<'_> {
         transition: Option<&Transition>,
         lyrics: &LyricsView,
         seek: Option<f32>,
+        seek_grow: f32,
         layout: Layout,
         alpha: f32,
     ) {
@@ -1851,7 +1856,7 @@ impl Canvas<'_> {
             let a = alpha * phase.alpha;
             // A drag belongs to the current track, not one fading out.
             let seek = seek.filter(|_| media.is_some_and(|m| std::ptr::eq(m, np)));
-            self.progress(fonts, np, layout, seek, a);
+            self.progress(fonts, np, layout, seek, seek_grow, a);
 
             let controls = left + layout.controls_dx();
             self.lyrics_icon(controls + LYRICS_BUTTON_X, CONTROLS_Y, a);
@@ -1919,7 +1924,12 @@ impl Canvas<'_> {
     /// Elapsed time, a thin bar with a knob, and time remaining. While the
     /// knob is dragged, `seek` (0..1) overrides the playback position and
     /// the knob grows.
-    fn progress(&mut self, fonts: &Fonts, np: &NowPlaying, layout: Layout, seek: Option<f32>, alpha: f32) {
+    /// iPhone style: a thick rounded bar with no knob, white up to the
+    /// playhead over a dim track, between small grey times. Dragged, it
+    /// swells (`grow`, 0..1) and brightens. `seek` (0..1) overrides the
+    /// playback position meanwhile.
+    #[allow(clippy::too_many_arguments)]
+    fn progress(&mut self, fonts: &Fonts, np: &NowPlaying, layout: Layout, seek: Option<f32>, grow: f32, alpha: f32) {
         let left = layout.left;
         let right = left + layout.player;
         let position = np.progress().map(|(pos, total)| match seek {
@@ -1936,21 +1946,23 @@ impl Canvas<'_> {
             ),
             None => ("--:--".to_owned(), "--:--".to_owned(), 0.0),
         };
-        self.text(&fonts.regular, &elapsed, 14.0, left + TIME_LEFT, TIME_BASELINE, PANEL_W, WHITE, alpha);
+        let times = alpha * (0.6 + 0.4 * grow.clamp(0.0, 1.0));
+        let baseline = PROGRESS_Y + 4.0;
+        self.text(&fonts.semibold, &elapsed, 12.0, left + TIME_LEFT, baseline, PANEL_W, WHITE, times);
         let time_right = right - TIME_RIGHT_INSET - layout.dots_clearance();
-        self.text_right(&fonts.regular, &remaining, 14.0, time_right, TIME_BASELINE, WHITE, alpha);
+        self.text_right(&fonts.semibold, &remaining, 12.0, time_right, baseline, WHITE, times);
 
         let (x0, x1) = layout.progress_span();
+        // A spring can overshoot a little; the bar bulges with it.
+        let h = PROGRESS_H + PROGRESS_GROW * grow.max(0.0);
+        let y = PROGRESS_Y - h / 2.0;
+        let Some(track) = rounded_rect(x0, y, x1 - x0, h, h / 2.0) else { return };
+        self.fill(&track, WHITE, alpha * (0.22 + 0.1 * grow.clamp(0.0, 1.0)));
+        // The played part is cut from the track, so its left end is round
+        // and the playhead edge straight.
         let x = x0 + (x1 - x0) * fraction.clamp(0.0, 1.0);
-        if let Some(track) = rounded_rect(x0, PROGRESS_Y - 1.5, x1 - x0, 3.0, 1.5) {
-            self.fill(&track, WHITE, alpha * 0.3);
-        }
-        if let Some(played) = rounded_rect(x0, PROGRESS_Y - 1.5, x - x0, 3.0, 1.5) {
-            self.fill(&played, WHITE, alpha * 0.9);
-        }
-        let knob_radius = if seek.is_some() { 6.0 } else { 3.0 };
-        if let Some(knob) = PathBuilder::from_circle(x, PROGRESS_Y, knob_radius) {
-            self.fill(&knob, WHITE, alpha);
+        if let Some(played) = Rect::from_xywh(x0, y, x - x0, h) {
+            self.fill_within(&PathBuilder::from_rect(played), &track, WHITE, alpha * (0.9 + 0.1 * grow.clamp(0.0, 1.0)));
         }
     }
 
@@ -2212,6 +2224,7 @@ mod tests {
                 transition: None,
                 lyrics: LyricsView::Synced { lines: &lines, scroll: 1.0 },
                 seek: None,
+                seek_grow: 0.0,
                 battery: Some(charging),
                 bluetooth: None,
                 alert: None,
@@ -2238,6 +2251,7 @@ mod tests {
                 transition: None,
                 lyrics: LyricsView::Missing,
                 seek: Some(0.6),
+                seek_grow: 1.0,
                 battery: Some(on_battery),
                 bluetooth: None,
                 alert: None,
@@ -2273,6 +2287,7 @@ mod tests {
             transition: None,
             lyrics: LyricsView::Missing,
             seek: None,
+            seek_grow: 0.0,
             battery: Some(charging),
             bluetooth: None,
             alert: None,
@@ -2319,6 +2334,7 @@ mod tests {
             transition: None,
             lyrics: LyricsView::Missing,
             seek: None,
+            seek_grow: 0.0,
             battery: Some(battery),
             bluetooth: Some(DeviceKind::Headphones),
             alert,

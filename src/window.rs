@@ -134,6 +134,8 @@ struct App {
     panel_width: Spring,
     /// Progress bar position (0..1) while its knob is being dragged.
     seeking: Option<f32>,
+    /// The progress bar swelling while dragged, in percent.
+    seek_grow: Spring,
     /// `None` on machines without a battery.
     battery: Option<Battery>,
     /// The alert on screen; `leaving` once its time is up and the notch is
@@ -294,6 +296,7 @@ pub fn run() -> Result<()> {
             lyrics_reveal: Spring::new(100.0),
             panel_width: Spring::new(EXPANDED.width),
             seeking: None,
+            seek_grow: Spring::new(0.0),
             battery,
             alert: None,
             alert_transition: None,
@@ -540,6 +543,7 @@ impl App {
                 self.volume,
                 self.page,
                 self.output_reveal,
+                self.seek_grow,
                 self.output_scroll,
                 self.output_highlight,
                 self.output_hover,
@@ -832,6 +836,7 @@ impl App {
         self.volume.update(dt);
         self.page.update(dt);
         self.output_reveal.update(dt);
+        self.seek_grow.update(dt);
         self.output_scroll.update(dt);
         self.output_highlight.update(dt);
         self.output_hover.update(dt);
@@ -899,6 +904,7 @@ impl App {
             transition,
             lyrics,
             seek: self.seeking,
+            seek_grow: self.seek_grow.value / 100.0,
             battery: self.battery,
             bluetooth: self.bluetooth_device.as_ref().map(|d| d.kind),
             alert: self.alert.as_ref().map(|(alert, _)| match alert {
@@ -1339,6 +1345,8 @@ impl App {
         }
         let Some(fraction) = self.progress_at((x, y), true) else { return Ok(()) };
         self.seeking = Some(fraction);
+        self.start_animation();
+        self.seek_grow.target = 100.0;
         // Keep receiving moves and the release even off the notch.
         unsafe { SetCapture(self.hwnd) };
         self.invalidate()
@@ -1369,6 +1377,8 @@ impl App {
     /// Releases the knob: seeks the player there.
     fn finish_seek(&mut self) -> Result<()> {
         let Some(fraction) = self.seeking.take() else { return Ok(()) };
+        self.start_animation();
+        self.seek_grow.target = 0.0;
         unsafe {
             let _ = ReleaseCapture();
         }
@@ -1609,6 +1619,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             let result = with_app(|app| {
                 let slider = app.slider_drag.take().is_some();
                 if app.seeking.take().is_some() || slider {
+                    app.start_animation();
+                    app.seek_grow.target = 0.0;
                     app.rearm_mouse_leave();
                     app.invalidate()
                 } else {
