@@ -11,15 +11,16 @@ media player, synced lyrics, and a Control Center when you hover it.
 - **Now playing** from any app that reports to Windows (Spotify, browsers,
   Media Player…): cover art, title, artist, a draggable progress bar, and
   previous / play-pause / next.
-- **Synced lyrics** from [LRCLIB](https://lrclib.net), scrolling with the song.
-- **Background from the cover**: the open notch fades from black into the
-  cover's color.
+- **Synced lyrics** from [LRCLIB](https://lrclib.net), scrolling with the song,
+  over a gradient in the cover's color.
 - **Control Center** (scroll down on the open notch): Wi-Fi, Bluetooth,
-  airplane mode, mute, and brightness and volume sliders. Brightness also
-  drives external monitors that support DDC/CI.
+  airplane mode and mute toggles, brightness and volume sliders, and Now
+  Playing, battery and Bluetooth modules. Brightness also drives external
+  monitors that support DDC/CI.
 - **Alerts** that grow out of the notch for:
+  - a new track, with an equalizer in the cover's color;
   - charger plugged in or out, low battery (20%, 10%), fully charged;
-  - volume and mute changes;
+  - volume and mute changes — these replace Windows' own volume pop-up;
   - Bluetooth devices connecting and disconnecting;
   - app notifications (WhatsApp, mail…) — click one to open the app.
 - **Indicators** on the resting notch: battery level and a connected
@@ -30,8 +31,10 @@ media player, synced lyrics, and a Control Center when you hover it.
 | Resting | Control Center |
 |---|---|
 | ![Resting notch](docs/screenshot-collapsed.png) | ![Control Center](docs/screenshot-controls.png) |
-| **Notification** | **Bluetooth** |
-| ![Notification](docs/screenshot-toast.png) | ![Bluetooth alert](docs/screenshot-bluetooth.png) |
+| **New track** | **Notification** |
+| ![Now Playing alert](docs/screenshot-now-playing.png) | ![Notification](docs/screenshot-toast.png) |
+| **Volume** | **Bluetooth** |
+| ![Volume alert](docs/screenshot-volume.png) | ![Bluetooth alert](docs/screenshot-bluetooth.png) |
 
 The screenshots are rendered from sample data.
 
@@ -54,7 +57,7 @@ Requires Windows 10 or 11, 64-bit.
 | Do this | To |
 |---|---|
 | Hover the notch | Open it |
-| Scroll down / up on the open notch | Switch between the player and Control Center |
+| Scroll down / up on the open notch | Switch between the player and Control Center (a touchpad drags the pages along) |
 | Click or drag the progress bar | Seek |
 | Click 💬 | Show or hide lyrics |
 | Click a notification | Open the app that sent it |
@@ -69,6 +72,10 @@ Requires Windows 10 or 11, 64-bit.
 - **Privacy**: to find lyrics, the title, artist, album and length of the
   playing track are sent to lrclib.net. Notification contents are read and
   shown locally and never leave your machine.
+- **Volume keys** are handled by notch-woy while it runs, so Windows' own
+  volume pop-up stays hidden; they go back to Windows when it exits. Laptop
+  Fn keys driven by the maker's own software, and headset buttons, may still
+  show their own pop-ups.
 - **Airplane mode** turns Wi-Fi and Bluetooth off; Windows' own airplane mode
   is not open to apps.
 - **External monitor brightness** needs DDC/CI, which some monitors have off
