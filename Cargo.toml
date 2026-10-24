@@ -2,6 +2,10 @@
 name = "notch-woy"
 version = "0.1.0"
 edition = "2024"
+description = "A Dynamic Island for Windows"
+license = "MIT"
+repository = "https://github.com/Panskuy/notch-woy"
+readme = "README.md"
 
 [dependencies]
 fontdue = "0.9"
@@ -21,3 +25,6 @@ opt-level = 3
 [dev-dependencies]
 # PNG output for the render preview test only.
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd", "png-format"] }
+
+[build-dependencies]
+winresource = "0.1"

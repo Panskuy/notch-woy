@@ -24,6 +24,7 @@ use crate::volume::{Volume, WM_VOLUME};
 use crate::lyrics::{Fetcher, LyricsState, Query, WM_LYRICS};
 use crate::media::{self, Command, Media, NowPlaying, WM_MEDIA};
 use crate::notifications::{Notifications, WM_TOAST};
+use crate::tray::{self, WM_TRAY};
 use crate::render::{
     self, Alert, Button, ControlHit, ControlsView, Fonts, LyricsView, Scene, Shape, Slider, Toggle,
     Transition, COLLAPSED, COLLAPSED_BATTERY_WIDTH, EXPANDED, MINI, PLAYER_ONLY_WIDTH,
@@ -194,6 +195,7 @@ pub fn run() -> Result<()> {
         };
         APP.with_borrow_mut(|slot| *slot = Some(app));
         appbar::register(hwnd);
+        tray::add(hwnd);
         with_app(App::relayout).transpose()?;
         watch_windows();
         with_app(App::update_obstruction);
@@ -1092,11 +1094,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
-        // Temporary quit until there is a tray icon.
-        WM_RBUTTONUP => {
-            unsafe {
-                let _ = DestroyWindow(hwnd);
-            }
+        WM_TRAY => {
+            tray::on_click(hwnd, lparam);
             LRESULT(0)
         }
         WM_APPBAR => {
@@ -1111,7 +1110,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         WM_DESTROY => {
             appbar::unregister(hwnd);
+            tray::remove(hwnd);
             unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        // Explorer restarted: its notification area forgot the icon.
+        _ if msg != 0 && msg == tray::taskbar_created_message() => {
+            tray::add(hwnd);
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
