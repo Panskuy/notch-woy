@@ -13,7 +13,7 @@ media player, synced lyrics, and a Control Center when you hover it.
   previous / play-pause / next.
 - **Synced lyrics** from [LRCLIB](https://lrclib.net), scrolling with the song,
   over a gradient in the cover's color.
-- **Control Center** (scroll down on the open notch): Wi-Fi, Bluetooth,
+- **Control Center** (scroll up on the open notch): Wi-Fi, Bluetooth,
   airplane mode and mute toggles, brightness and volume sliders, and Now
   Playing, battery and Bluetooth modules. Brightness also drives external
   monitors that support DDC/CI.
@@ -57,7 +57,7 @@ Requires Windows 10 or 11, 64-bit.
 | Do this | To |
 |---|---|
 | Hover the notch | Open it |
-| Scroll down / up on the open notch | Switch between the player and Control Center (a touchpad drags the pages along) |
+| Scroll up / down on the open notch | Switch between Control Center (above) and the player (a touchpad drags the pages along) |
 | Click or drag the progress bar | Seek |
 | Click 💬 | Show or hide lyrics |
 | Click a notification | Open the app that sent it |
@@ -101,3 +101,6 @@ with a console for logs; debug builds never turn autostart on by themselves.
 ## License
 
 [MIT](LICENSE)
+
+The [Inter](https://rsms.me/inter/) font in `assets/fonts` is under the
+[SIL Open Font License](assets/fonts/OFL.txt).

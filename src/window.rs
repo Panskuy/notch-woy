@@ -23,10 +23,12 @@ use crate::volume_keys::{self, VolumeKey, WM_VOLUME_KEY};
 use crate::lyrics::{Fetcher, LyricsState, Query, WM_LYRICS};
 use crate::media::{self, Command, Media, NowPlaying, WM_MEDIA};
 use crate::notifications::{Notifications, WM_TOAST};
+use crate::outputs::{Output, Outputs, WM_OUTPUTS};
 use crate::tray::{self, WM_TRAY};
 use crate::render::{
-    self, Alert, Button, ControlHit, ControlsView, Fonts, LyricsView, Scene, Shape, Slider, Toggle,
-    Transition, COLLAPSED, COLLAPSED_BATTERY_WIDTH, EXPANDED, MINI, PLAYER_ONLY_WIDTH,
+    self, Alert, Button, ControlHit, ControlsView, Fonts, LyricsView, OutputsView, Scene, Shape, Slider, Toggle,
+    OUTPUT_ROWS_SHOWN,
+    Transition, COLLAPSED, COLLAPSED_BATTERY_WIDTH, EXPANDED, MINI, PLAYER_ONLY_WIDTH, SHADOW_PAD,
 };
 
 /// Window canvas in logical pixels. It fits the expanded notch plus spring
@@ -47,6 +49,12 @@ const PROGRESS_INTERVAL_MS: u32 = 100;
 /// lifted, so the pages settle.
 const SCROLL_END_TIMER: usize = 4;
 const SCROLL_END_MS: u32 = 120;
+
+/// Animates the resting notch's equalizer while a track plays. Its own
+/// ~30 fps tick rather than the frame loop: the bars are tiny, and it can
+/// run for hours.
+const EQUALIZER_TIMER: usize = 5;
+const EQUALIZER_INTERVAL_MS: u32 = 33;
 /// Page travel (0..100) per unit of wheel delta: two mouse notches' worth
 /// of touchpad scrolling turns a page.
 const PAGE_PER_WHEEL_UNIT: f32 = 100.0 / 240.0;
@@ -87,6 +95,10 @@ const TRACK_PULSE: (f32, f32) = (320.0, 90.0);
 /// The same, when one alert replaces another; softer, as the shape is
 /// already out.
 const ALERT_PULSE: (f32, f32) = (260.0, 60.0);
+/// Closes the output picker once a pick's highlight has slid over.
+const PICKER_CLOSE_TIMER: usize = 7;
+const PICKER_CLOSE_MS: u32 = 420;
+
 /// How long replaced alert content takes to slide out and the new in.
 const ALERT_TRANSITION: Duration = Duration::from_millis(450);
 
@@ -162,6 +174,30 @@ struct App {
     fullscreen: bool,
     /// The primary monitor's bounds, in physical pixels.
     monitor: RECT,
+    /// `EQUALIZER_TIMER` is running.
+    equalizer_ticking: bool,
+    outputs: Outputs,
+    /// The output devices, as last read.
+    output_list: Vec<Output>,
+    /// The output picker is open over the player.
+    output_picker: bool,
+    /// How far the picker has replaced the player, in percent.
+    output_reveal: Spring,
+    /// First picker row shown.
+    output_scroll: Spring,
+    /// Picker row the highlight is on; springs to a new pick.
+    output_highlight: Spring,
+    /// Picker row under the pointer, and how much its hover shows (percent).
+    output_hover: Spring,
+    output_hover_alpha: Spring,
+    /// Picker row the mouse button went down on.
+    output_pressed: Option<usize>,
+    /// Click-through window for the open notch's shadow, and its canvas
+    /// while it shows (freed at rest).
+    shadow_hwnd: HWND,
+    shadow: Option<(Pixmap, Surface)>,
+    /// Width, height and radius the shadow was last drawn for.
+    shadow_shape: Option<(f32, f32, f32)>,
 }
 
 thread_local! {
@@ -192,6 +228,35 @@ pub fn run() -> Result<()> {
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class,
             w!("notch-woy"),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            Some(instance),
+            None,
+        )?;
+
+        // The open notch's shadow, in a window of its own just behind it:
+        // TRANSPARENT lets the mouse through, which the notch's own window
+        // cannot do for any pixel that is not fully clear.
+        let shadow_class = w!("NotchWoyShadow");
+        let shadow_wc = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(shadow_proc),
+            hInstance: instance,
+            lpszClassName: shadow_class,
+            ..Default::default()
+        };
+        if RegisterClassExW(&shadow_wc) == 0 {
+            return Err(Error::from_win32());
+        }
+        let shadow_hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            shadow_class,
+            w!("notch-woy shadow"),
             WS_POPUP,
             0,
             0,
@@ -249,7 +314,22 @@ pub fn run() -> Result<()> {
             obstructed: false,
             fullscreen: false,
             monitor: RECT::default(),
+            equalizer_ticking: false,
+            outputs: Outputs::new(hwnd),
+            output_list: Vec::new(),
+            output_picker: false,
+            output_reveal: Spring::new(0.0),
+            output_scroll: Spring::smooth(0.0),
+            output_highlight: Spring::new(0.0),
+            output_hover: Spring::new(0.0),
+            output_hover_alpha: Spring::smooth(0.0),
+            output_pressed: None,
+            shadow_hwnd,
+            shadow: None,
+            shadow_shape: None,
         };
+        // Read ahead so the picker opens with the list already there.
+        app.outputs.refresh();
         APP.with_borrow_mut(|slot| *slot = Some(app));
         tray::add(hwnd);
         volume_keys::install(hwnd);
@@ -459,6 +539,11 @@ impl App {
                 self.panel_width,
                 self.volume,
                 self.page,
+                self.output_reveal,
+                self.output_scroll,
+                self.output_highlight,
+                self.output_hover,
+                self.output_hover_alpha,
             ]
             .iter()
             .chain(&self.toggle_on)
@@ -519,6 +604,13 @@ impl App {
             // It opens on the player next time, as the island does.
             self.page = Spring::smooth(0.0);
             self.page_drag = None;
+            self.output_picker = false;
+            self.output_reveal = Spring::new(0.0);
+            self.output_hover_alpha = Spring::smooth(0.0);
+            self.output_pressed = None;
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), PICKER_CLOSE_TIMER);
+            }
         }
 
         // A notification stays while the pointer rests on it, then gets a
@@ -578,6 +670,10 @@ impl App {
             self.fullscreen = fullscreen;
             unsafe {
                 let _ = ShowWindow(self.hwnd, if fullscreen { SW_HIDE } else { SW_SHOWNOACTIVATE });
+            }
+            if fullscreen {
+                self.hide_shadow();
+                self.shadow_shape = None;
             }
         }
     }
@@ -735,6 +831,11 @@ impl App {
         self.panel_width.update(dt);
         self.volume.update(dt);
         self.page.update(dt);
+        self.output_reveal.update(dt);
+        self.output_scroll.update(dt);
+        self.output_highlight.update(dt);
+        self.output_hover.update(dt);
+        self.output_hover_alpha.update(dt);
         for spring in self.toggle_on.iter_mut().chain(&mut self.toggle_press) {
             spring.update(dt);
         }
@@ -809,9 +910,160 @@ impl App {
             }),
             page: self.page.value / 100.0,
             controls,
+            clock: self.started.elapsed().as_secs_f32(),
+            outputs: OutputsView {
+                list: &self.output_list,
+                reveal: self.output_reveal.value / 100.0,
+                scroll: self.output_scroll.value,
+                highlight: self.output_highlight.value,
+                hover: self.output_hover.value,
+                hover_alpha: self.output_hover_alpha.value / 100.0,
+                pressed: self.output_pressed,
+            },
         };
         render::draw(&mut self.pixmap, self.scale, &scene, self.fonts.as_ref());
-        self.surface.present(self.hwnd, &self.pixmap, self.origin)
+        self.update_equalizer_timer();
+        self.surface.present(self.hwnd, &self.pixmap, self.origin)?;
+        self.update_shadow(shape)
+    }
+
+    /// Redraws the shadow when the notch's shape changed; hides it, and
+    /// frees its canvas, once the notch is back at rest.
+    fn update_shadow(&mut self, shape: Shape) -> Result<()> {
+        let key = (shape.width, shape.height, shape.radius);
+        if self.shadow_shape == Some(key) {
+            return Ok(());
+        }
+        self.shadow_shape = Some(key);
+        if shape.height <= COLLAPSED.height {
+            self.hide_shadow();
+            return Ok(());
+        }
+        let showing = self.shadow.is_some();
+        // Wider than the notch's canvas by the same amount on either side,
+        // so both stay centered on the screen.
+        let pad = (SHADOW_PAD * self.scale).round() as u32;
+        let origin = POINT { x: self.origin.x - pad as i32, y: self.origin.y };
+        let (pixmap, surface) = match &mut self.shadow {
+            Some(shadow) => shadow,
+            None => {
+                let (w, h) = (self.pixmap.width() + 2 * pad, self.pixmap.height() + pad);
+                let pixmap = Pixmap::new(w, h).expect("non-zero canvas size");
+                self.shadow.insert((pixmap, Surface::new(w as i32, h as i32)?))
+            }
+        };
+        render::draw_shadow(pixmap, self.scale, shape);
+        surface.present(self.shadow_hwnd, pixmap, origin)?;
+        if !showing {
+            unsafe {
+                // Just behind the notch.
+                let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+                SetWindowPos(self.shadow_hwnd, Some(self.hwnd), 0, 0, 0, 0, flags)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn hide_shadow(&mut self) {
+        if self.shadow.take().is_some() {
+            unsafe {
+                let _ = ShowWindow(self.shadow_hwnd, SW_HIDE);
+            }
+        }
+    }
+
+    /// Runs the equalizer tick only while the resting bars are on screen
+    /// and moving.
+    fn update_equalizer_timer(&mut self) {
+        let playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
+        let showing = playing && !self.hovered && self.alert.is_none() && !self.obstructed && !self.fullscreen;
+        if showing == self.equalizer_ticking {
+            return;
+        }
+        self.equalizer_ticking = showing;
+        unsafe {
+            if showing {
+                SetTimer(Some(self.hwnd), EQUALIZER_TIMER, EQUALIZER_INTERVAL_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), EQUALIZER_TIMER);
+            }
+        }
+    }
+
+    /// Opens the output list over the player, scrolled to show the
+    /// current output.
+    fn open_output_picker(&mut self) {
+        self.outputs.refresh();
+        self.start_animation();
+        self.output_picker = true;
+        self.output_reveal.target = 100.0;
+        let current = self.output_list.iter().position(|o| o.default).unwrap_or(0);
+        let max = self.output_list.len().saturating_sub(OUTPUT_ROWS_SHOWN);
+        self.output_scroll = Spring::smooth(current.saturating_sub(OUTPUT_ROWS_SHOWN - 1).min(max) as f32);
+        self.output_highlight = Spring::new(current as f32);
+        self.output_hover_alpha = Spring::smooth(0.0);
+        self.output_pressed = None;
+    }
+
+    fn close_output_picker(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), PICKER_CLOSE_TIMER);
+        }
+        if self.output_picker {
+            self.start_animation();
+            self.output_picker = false;
+            self.output_reveal.target = 0.0;
+            self.output_hover_alpha.target = 0.0;
+            self.output_pressed = None;
+        }
+    }
+
+    /// The picker row under the pointer, once the picker is open.
+    fn output_row_at(&self, x: f32, y: f32) -> Option<usize> {
+        if !self.output_picker || self.output_reveal.value < 0.8 {
+            return None;
+        }
+        render::output_at(
+            self.pixmap.width(),
+            self.scale,
+            self.panel_width.value,
+            self.output_scroll.value,
+            self.output_list.len(),
+            (x, y),
+        )
+    }
+
+    /// The hover highlight follows the pointer from row to row.
+    fn on_picker_hover(&mut self, x: f32, y: f32) {
+        if !self.output_picker {
+            return;
+        }
+        let row = self.output_row_at(x, y);
+        let (alpha, target) = match row {
+            Some(row) => (100.0, row as f32),
+            None => (0.0, self.output_hover.target),
+        };
+        if self.output_hover_alpha.target == alpha && self.output_hover.target == target {
+            return;
+        }
+        self.start_animation();
+        // Appearing, it starts on its row rather than gliding in from the
+        // last one.
+        if self.output_hover_alpha.value < 1.0 {
+            self.output_hover = Spring::new(target);
+        }
+        self.output_hover.target = target;
+        self.output_hover_alpha.target = alpha;
+        if row != self.output_pressed {
+            self.output_pressed = None;
+        }
+    }
+
+    fn on_outputs(&mut self) -> Result<()> {
+        self.output_list = self.outputs.list();
+        let max = self.output_list.len().saturating_sub(OUTPUT_ROWS_SHOWN) as f32;
+        self.output_scroll.target = self.output_scroll.target.min(max);
+        self.invalidate()
     }
 
     /// Whether the open notch is showing (or turning to) the Control Center.
@@ -819,9 +1071,9 @@ impl App {
         self.hovered && self.page.target > 50.0
     }
 
-    /// Mouse wheel or touchpad scroll: down for Control Center, up for the
-    /// player. A mouse notch turns a whole page. A touchpad drags the pages
-    /// along with the fingers (rubber-banding past either end) and lets go
+    /// Mouse wheel or touchpad scroll: up for Control Center (the page
+    /// above), down for the player. A mouse notch turns a whole page. A
+    /// touchpad drags the pages along with the fingers (rubber-banding past either end) and lets go
     /// onto a page once the fingers stop.
     fn on_wheel(&mut self, delta: i32) -> Result<()> {
         let open = self.hovered && self.height.value >= EXPANDED.height * 0.9 && !self.showing_toast();
@@ -829,14 +1081,22 @@ impl App {
             return Ok(());
         }
         self.start_animation();
-        // Mouse wheels move in whole notches of 120; touchpads in small steps.
-        if delta.abs() >= 120 && self.page_drag.is_none() {
-            self.settle_page(if delta < 0 { 100.0 } else { 0.0 });
+        if self.output_picker && !self.on_controls_page() {
+            let max = self.output_list.len().saturating_sub(OUTPUT_ROWS_SHOWN) as f32;
+            // A wheel notch is a row; a touchpad scrolls smoothly.
+            let target = self.output_scroll.target - delta as f32 / 120.0;
+            self.output_scroll.target = target.clamp(0.0, max);
             return Ok(());
         }
-        let raw = self.page_drag.unwrap_or(self.page.target) - delta as f32 * PAGE_PER_WHEEL_UNIT;
+        // Mouse wheels move in whole notches of 120; touchpads in small steps.
+        if delta.abs() >= 120 && self.page_drag.is_none() {
+            self.settle_page(if delta > 0 { 100.0 } else { 0.0 });
+            return Ok(());
+        }
+        // Control Center is the page above: scrolling up brings it down.
+        let raw = self.page_drag.unwrap_or(self.page.target) + delta as f32 * PAGE_PER_WHEEL_UNIT;
         self.page_drag = Some(raw);
-        self.page_drag_toward_controls = delta < 0;
+        self.page_drag_toward_controls = delta > 0;
         self.page.target = rubber_band(raw);
         unsafe {
             SetTimer(Some(self.hwnd), SCROLL_END_TIMER, SCROLL_END_MS, None);
@@ -1052,6 +1312,10 @@ impl App {
     /// Starts dragging a Control Center slider or the progress knob if the
     /// press is on one.
     fn on_mouse_down(&mut self, x: f32, y: f32) -> Result<()> {
+        if self.output_picker {
+            self.output_pressed = self.output_row_at(x, y);
+            return self.invalidate();
+        }
         if self.on_controls_page() {
             match self.control_at(x, y) {
                 Some(ControlHit::Slider(slider, value)) => {
@@ -1108,19 +1372,40 @@ impl App {
         unsafe {
             let _ = ReleaseCapture();
         }
-        if let Some(np) = self.now_playing.as_mut() {
-            if let Some(timeline) = np.timeline.as_mut() {
-                let position = timeline.duration.mul_f32(fraction);
-                self.media.send(Command::Seek(position));
-                // Show the new position now rather than snapping back until
-                // the player reports it.
-                timeline.position = position;
-                timeline.updated = SystemTime::now();
-            }
+        let duration = self.now_playing.as_ref().and_then(|np| np.timeline.as_ref()).map(|t| t.duration);
+        if let Some(duration) = duration {
+            self.seek_to(duration.mul_f32(fraction));
         }
         self.update_lyric_line(true);
         self.rearm_mouse_leave();
         self.invalidate()
+    }
+
+    fn seek_to(&mut self, position: Duration) {
+        let Some(timeline) = self.now_playing.as_mut().and_then(|np| np.timeline.as_mut()) else { return };
+        self.media.send(Command::Seek(position));
+        // Show the new position now rather than snapping back until the
+        // player reports it.
+        timeline.position = position;
+        timeline.updated = SystemTime::now();
+    }
+
+    /// The synced lyric line under a click, if the lyrics panel shows one.
+    fn lyric_at(&self, x: f32, y: f32) -> Option<Duration> {
+        let LyricsState::Found(lyrics) = &self.lyrics_state else { return None };
+        if !lyrics.synced {
+            return None;
+        }
+        let index = render::lyric_at(
+            self.pixmap.width(),
+            self.scale,
+            self.panel_width.value,
+            self.lyrics_reveal.value / 100.0,
+            self.lyric_scroll.value,
+            lyrics.lines.len(),
+            (x, y),
+        )?;
+        Some(lyrics.lines[index].time)
     }
 
     /// Asks for WM_MOUSELEAVE once the cursor leaves the opaque area. If it
@@ -1153,8 +1438,39 @@ impl App {
             }
             return self.invalidate();
         }
+        if self.output_picker {
+            let at = self.output_row_at(x, y);
+            self.output_pressed = None;
+            self.start_animation();
+            match at {
+                Some(index) => {
+                    let id = self.output_list[index].id.clone();
+                    // Ticked right away; the re-read list confirms it.
+                    for output in &mut self.output_list {
+                        output.default = output.id == id;
+                    }
+                    self.outputs.select(id);
+                    // Let the highlight land before the picker goes.
+                    self.output_highlight.target = index as f32;
+                    unsafe {
+                        SetTimer(Some(self.hwnd), PICKER_CLOSE_TIMER, PICKER_CLOSE_MS, None);
+                    }
+                }
+                // A tap anywhere else just closes it.
+                None => self.close_output_picker(),
+            }
+            return self.invalidate();
+        }
         if !self.controls_ready() {
             return Ok(());
+        }
+        // Tapping a lyric line plays from there, as in Apple Music; the
+        // lyrics scroll to it.
+        let has_length = self.now_playing.as_ref().is_some_and(|np| np.timeline.is_some());
+        if let Some(time) = self.lyric_at(x, y).filter(|_| has_length) {
+            self.seek_to(time);
+            self.update_lyric_line(false);
+            return self.invalidate();
         }
         let button = render::button_at(
             self.pixmap.width(),
@@ -1168,6 +1484,10 @@ impl App {
             Some(Button::Media(command)) => command,
             Some(Button::Lyrics) => {
                 self.toggle_lyrics();
+                return Ok(());
+            }
+            Some(Button::Output) => {
+                self.open_output_picker();
                 return Ok(());
             }
             None => return Ok(()),
@@ -1203,6 +1523,9 @@ impl App {
                 self.pixmap = Pixmap::new(w, h).expect("non-zero canvas size");
                 self.surface = Surface::new(w as i32, h as i32)?;
             }
+            // Redrawn below for the new size and position.
+            self.hide_shadow();
+            self.shadow_shape = None;
 
             let mon = info.rcMonitor;
             self.monitor = mon;
@@ -1222,6 +1545,10 @@ fn mouse_pos(lparam: LPARAM) -> (f32, f32) {
     (x, y)
 }
 
+extern "system" fn shadow_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_DPICHANGED | WM_DISPLAYCHANGE => {
@@ -1239,6 +1566,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     app.on_slider_move(y)
                 } else {
                     app.set_hovered(true);
+                    app.on_picker_hover(x, y);
                     Ok(())
                 }
             });
@@ -1334,6 +1662,27 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_TOAST => {
             if let Some(Err(e)) = with_app(App::on_toast) {
                 eprintln!("notification redraw failed: {e}");
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == PICKER_CLOSE_TIMER => {
+            with_app(|app| {
+                app.close_output_picker();
+                app.invalidate()
+            });
+            LRESULT(0)
+        }
+        WM_OUTPUTS => {
+            if let Some(Err(e)) = with_app(App::on_outputs) {
+                eprintln!("outputs redraw failed: {e}");
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == EQUALIZER_TIMER => {
+            // The animation loop already redraws every frame.
+            let result = with_app(|app| if app.is_animating() { Ok(()) } else { app.redraw() });
+            if let Some(Err(e)) = result {
+                eprintln!("equalizer redraw failed: {e}");
             }
             LRESULT(0)
         }

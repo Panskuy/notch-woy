@@ -14,6 +14,7 @@ mod media;
 #[cfg(test)]
 mod memory;
 mod notifications;
+mod outputs;
 mod palette;
 mod render;
 mod tray;

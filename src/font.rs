@@ -2,10 +2,10 @@
 //! font file only when a glyph is drawn. (fontdue, used before, decoded
 //! every glyph of Segoe UI up front: ~40 MB for two faces.)
 
-use ab_glyph::{point, Font as _, FontVec, PxScale, ScaleFont as _};
+use ab_glyph::{point, Font as _, FontRef, PxScale, ScaleFont as _};
 
 pub struct Font {
-    inner: FontVec,
+    inner: FontRef<'static>,
     /// Sizes here are per em (1 em = `px`), but `ab_glyph` scales by the
     /// font's ascent-to-descent height; this converts one to the other.
     em_to_scale: f32,
@@ -25,8 +25,9 @@ pub struct Glyph {
 }
 
 impl Font {
-    pub fn load(path: &str) -> Option<Self> {
-        let inner = FontVec::try_from_vec(std::fs::read(path).ok()?).ok()?;
+    /// A font file embedded in the exe, read in place.
+    pub fn embedded(data: &'static [u8]) -> Option<Self> {
+        let inner = FontRef::try_from_slice(data).ok()?;
         let em_to_scale = inner.height_unscaled() / inner.units_per_em()?;
         Some(Self { inner, em_to_scale })
     }

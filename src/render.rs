@@ -20,6 +20,7 @@ use crate::controls::ControlState;
 use crate::lyrics::Line;
 use crate::media::{art_changed, track_changed, Command, NowPlaying};
 use crate::notifications::Toast;
+use crate::outputs::{Output, OutputKind};
 use crate::palette::Rgb;
 
 /// Notch size. The top edge sits flush with the screen.
@@ -42,7 +43,7 @@ pub const BATTERY_ALERT: Shape = Shape { width: 340.0, height: 40.0, radius: 18.
 pub const VOLUME_ALERT: Shape = Shape { width: 300.0, height: 32.0, radius: 14.0 };
 
 /// App notifications open into a banner card, like iOS.
-pub const TOAST_ALERT: Shape = Shape { width: 400.0, height: 84.0, radius: 30.0 };
+pub const TOAST_ALERT: Shape = Shape { width: 420.0, height: 80.0, radius: 28.0 };
 /// Resting notch while an app's window sits under it: a slim pill that
 /// stays out of the way of title bars and tabs.
 pub const MINI: Shape = Shape { width: 80.0, height: 10.0, radius: 5.0 };
@@ -92,12 +93,27 @@ const PROGRESS_Y: f32 = 91.0;
 const PROGRESS_X0: f32 = 76.0;
 /// Progress bar's right end, from the player's right edge.
 const PROGRESS_RIGHT_INSET: f32 = 66.0;
+/// Kept clear of the page dots at the open notch's right edge.
+const DOTS_CLEARANCE: f32 = 14.0;
 const CONTROLS_Y: f32 = 118.0;
 // Control centers in a `PANEL_W` player; wider players shift them to stay centered.
 const LYRICS_BUTTON_X: f32 = 53.0;
 const PREVIOUS_X: f32 = 92.0;
 const PLAY_X: f32 = 131.0;
 const NEXT_X: f32 = 170.0;
+/// Mirrors the lyrics button across play/pause.
+const OUTPUT_BUTTON_X: f32 = 2.0 * PLAY_X - LYRICS_BUTTON_X;
+/// Output picker rows, from the top of the open notch.
+const OUTPUT_TOP: f32 = 12.0;
+const OUTPUT_ROW_H: f32 = 26.0;
+/// Rows the picker shows at once; more scroll.
+pub const OUTPUT_ROWS_SHOWN: usize = 5;
+/// The picker's sheet, around its rows, and the AirPlay button it grows
+/// out of (as a circle this wide).
+const SHEET_PAD: f32 = 6.0;
+const SHEET_RADIUS: f32 = 16.0;
+const SHEET_FROM: f32 = 30.0;
+const SHEET_RGB: Rgb = [28, 28, 31];
 const BUTTON_HIT_RADIUS: f32 = 17.0;
 const LYRICS_PAD: f32 = 18.0;
 const LYRICS_BASELINE: f32 = 76.0;
@@ -135,29 +151,31 @@ fn battery_color(b: Battery) -> Rgb {
 pub struct Fonts {
     regular: Font,
     semibold: Font,
+    bold: Font,
+    extrabold: Font,
     /// Rasterized glyphs by (font, char, pixel size). Text is redrawn every
     /// animation frame, so rasterizing each time would dominate the frame.
-    glyphs: RefCell<HashMap<(bool, char, u32), Rc<Glyph>>>,
+    glyphs: RefCell<HashMap<(usize, char, u32), Rc<Glyph>>>,
 }
 
 /// Plenty for a few sizes of a few scripts; cleared rather than evicted.
 const GLYPH_CACHE_LIMIT: usize = 4096;
 
 impl Fonts {
-    /// Loads Segoe UI from the system font folder.
+    /// Inter, embedded in the exe (assets/fonts, SIL Open Font License).
     pub fn load() -> Option<Self> {
-        let dir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
-        let load = |name: &str| Font::load(&format!(r"{dir}\Fonts\{name}"));
         Some(Self {
-            regular: load("segoeui.ttf")?,
-            semibold: load("seguisb.ttf").or_else(|| load("segoeuib.ttf"))?,
+            regular: Font::embedded(include_bytes!("../assets/fonts/Inter-Regular.ttf"))?,
+            semibold: Font::embedded(include_bytes!("../assets/fonts/Inter-SemiBold.ttf"))?,
+            bold: Font::embedded(include_bytes!("../assets/fonts/Inter-Bold.ttf"))?,
+            extrabold: Font::embedded(include_bytes!("../assets/fonts/Inter-ExtraBold.ttf"))?,
             glyphs: RefCell::default(),
         })
     }
 
     /// `font` must be one of this set's fonts.
     fn glyph(&self, font: &Font, ch: char, px: f32) -> Rc<Glyph> {
-        let key = (std::ptr::eq(font, &self.semibold), ch, px.to_bits());
+        let key = (font as *const Font as usize, ch, px.to_bits());
         let mut glyphs = self.glyphs.borrow_mut();
         if let Some(glyph) = glyphs.get(&key) {
             return glyph.clone();
@@ -195,6 +213,27 @@ pub struct Scene<'a> {
     /// Open notch page, animated: 0 = player, 1 = Control Center.
     pub page: f32,
     pub controls: ControlsView<'a>,
+    /// Seconds on a running clock; drives the resting notch's equalizer.
+    pub clock: f32,
+    pub outputs: OutputsView<'a>,
+}
+
+/// The player's audio output picker.
+#[derive(Clone, Copy, Default)]
+pub struct OutputsView<'a> {
+    pub list: &'a [Output],
+    /// How far it has replaced the player, 0..1.
+    pub reveal: f32,
+    /// First row shown, fractional while scrolling.
+    pub scroll: f32,
+    /// Row the highlight sits on, fractional while it slides to a new pick.
+    pub highlight: f32,
+    /// Row under the pointer, fractional as the hover glides between rows,
+    /// and how much it shows (0..1).
+    pub hover: f32,
+    pub hover_alpha: f32,
+    /// Row being pressed.
+    pub pressed: Option<usize>,
 }
 
 /// What the Control Center page shows.
@@ -286,6 +325,8 @@ pub enum LyricsView<'a> {
 pub enum Button {
     Media(Command),
     Lyrics,
+    /// Opens the audio output picker.
+    Output,
 }
 
 /// Horizontal layout of the open notch, in canvas coordinates.
@@ -312,9 +353,15 @@ impl Layout {
         }
     }
 
+    /// Extra room on the player's right while it reaches the notch's edge
+    /// (lyrics hidden), where the page dots sit.
+    fn dots_clearance(&self) -> f32 {
+        DOTS_CLEARANCE * (1.0 - self.lyrics)
+    }
+
     /// Left and right ends of the progress bar.
     fn progress_span(&self) -> (f32, f32) {
-        (self.left + PROGRESS_X0, self.left + self.player - PROGRESS_RIGHT_INSET)
+        (self.left + PROGRESS_X0, self.left + self.player - PROGRESS_RIGHT_INSET - self.dots_clearance())
     }
 
     /// Shift that keeps the controls centered in a player wider than `PANEL_W`.
@@ -382,6 +429,54 @@ fn expansion(shape: Shape) -> f32 {
     ((shape.height - COLLAPSED.height) / (EXPANDED.height - COLLAPSED.height)).clamp(0.0, 1.0)
 }
 
+/// Room the shadow's canvas has beyond the notch's on the left, right and
+/// bottom, in logical px: the shadow spreads further than the notch's
+/// canvas reaches.
+pub const SHADOW_PAD: f32 = 40.0;
+
+/// Wide, faint shadow around the open notch, centered on a canvas
+/// `SHADOW_PAD` larger than the notch's. It deepens as the notch opens;
+/// returns false when there is none (the notch is at rest).
+pub fn draw_shadow(pixmap: &mut Pixmap, scale: f32, shape: Shape) -> bool {
+    pixmap.fill(Color::TRANSPARENT);
+    let t = expansion(shape);
+    if t <= 0.0 {
+        return false;
+    }
+    // No blur in tiny-skia: each pixel's darkness comes from its distance
+    // to the notch (a rounded rect, nudged down), easing out to nothing.
+    const BLUR: f32 = 70.0;
+    const DROP: f32 = 8.0;
+    const DARKEST: f32 = 0.26;
+    let (pw, ph) = (pixmap.width() as usize, pixmap.height() as usize);
+    let canvas_w = pw as f32 / scale;
+    // Rect center and half extents, in logical px; its top is off screen.
+    let (cx, half_w) = (canvas_w / 2.0, shape.width / 2.0);
+    let (top, bottom) = (-shape.radius, shape.height + DROP);
+    let (cy, half_h) = ((top + bottom) / 2.0, (bottom - top) / 2.0);
+    let r = shape.radius.min(half_w).min(half_h);
+    let peak = DARKEST * t;
+
+    // Only pixels within reach of the shadow.
+    let x0 = (((cx - half_w - BLUR) * scale).floor().max(0.0)) as usize;
+    let x1 = (((cx + half_w + BLUR) * scale).ceil() as usize).min(pw);
+    let y1 = (((bottom + BLUR) * scale).ceil() as usize).min(ph);
+    let data = pixmap.data_mut();
+    for py in 0..y1 {
+        let qy = ((py as f32 + 0.5) / scale - cy).abs() - half_h + r;
+        for px in x0..x1 {
+            let qx = ((px as f32 + 0.5) / scale - cx).abs() - half_w + r;
+            let outside = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r;
+            let u = (outside / BLUR).clamp(0.0, 1.0);
+            // Fades fast near the notch, then trails off far and faint.
+            let alpha = peak * (1.0 - u).powi(2);
+            // Black, premultiplied: only alpha is set.
+            data[(py * pw + px) * 4 + 3] = (alpha * 255.0).round() as u8;
+        }
+    }
+    true
+}
+
 /// Draws the notch centered horizontally at the top of a transparent canvas.
 pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts>) {
     let Scene { shape, media, .. } = *scene;
@@ -419,11 +514,14 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
     let t = expansion(shape);
     let expanded_alpha = ((t - 0.35) / 0.65).clamp(0.0, 1.0) * (1.0 - alert_alpha);
     // The cover gradient belongs to the music page with lyrics showing; it
-    // fades with the lyrics panel and as the page scrolls away.
+    // fades with the lyrics panel and scrolls away with the page.
     let page = scene.page.clamp(0.0, 1.0);
-    let gradient_alpha = expanded_alpha * scene.lyrics_reveal.clamp(0.0, 1.0) * (1.0 - page);
-    if gradient_alpha > 0.0 {
-        background(pixmap, &path, ts, shape.height, media, transition, gradient_alpha);
+    // The output picker covers the player, gradient and all.
+    let picker = scene.outputs.reveal.clamp(0.0, 1.0);
+    let gradient_alpha = expanded_alpha * scene.lyrics_reveal.clamp(0.0, 1.0) * (1.0 - picker);
+    if gradient_alpha > 0.0 && scene.page < 1.0 {
+        let shift = scene.page * PAGE_TRAVEL;
+        background(pixmap, &path, ts, shape.height, shift, media, transition, gradient_alpha);
     }
 
     // Content is clipped to the notch so it is revealed as the shape grows.
@@ -438,7 +536,7 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
     let unshrunk = ((shape.width - MINI.width) / (rest_width - MINI.width)).clamp(0.0, 1.0);
     let collapsed_alpha = (1.0 - t * 3.0).clamp(0.0, 1.0) * (1.0 - alert_alpha) * unshrunk * unshrunk;
     if collapsed_alpha > 0.0 {
-        canvas.collapsed(media, transition, scene.battery, scene.bluetooth, left, right, collapsed_alpha);
+        canvas.collapsed(media, transition, scene.battery, scene.bluetooth, scene.clock, left, right, collapsed_alpha);
     }
 
     if let Some(alert) = scene.alert.as_ref().filter(|_| alert_alpha > 0.0) {
@@ -459,21 +557,28 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
 
     if expanded_alpha > 0.0 {
         let layout = Layout::new(canvas_w, scene.panel_width, scene.lyrics_reveal);
-        // Pages slide vertically past each other, like Control Center's.
-        // The old one is mostly gone before the new one shows, so the two
-        // barely overlap.
+        // Pages sit one above the other, Control Center on top, and scroll
+        // as one, a full page per turn, the notch's edge cutting them off;
+        // no fading.
         // Positions follow the raw value, which a touchpad can stretch a
-        // little past either page (rubber band); fades use the clamped one.
+        // little past either page (rubber band).
         let raw = scene.page;
         let p = page;
-        let (out_alpha, in_alpha) = (((0.6 - p) / 0.6).clamp(0.0, 1.0), ((p - 0.4) / 0.6).clamp(0.0, 1.0));
-        if out_alpha > 0.0 {
-            canvas.dy = -raw * PAGE_SLIDE;
-            canvas.expanded(media, transition, &scene.lyrics, scene.seek, layout, expanded_alpha * out_alpha);
+        if raw < 1.0 {
+            let a = expanded_alpha;
+            canvas.dy = raw * PAGE_TRAVEL;
+            // The player dims away behind the sheet growing over it.
+            let fade = (1.0 - picker * 1.3).clamp(0.0, 1.0);
+            if fade > 0.0 {
+                canvas.expanded(media, transition, &scene.lyrics, scene.seek, layout, a * fade);
+            }
+            if scene.outputs.reveal > 0.001 {
+                canvas.output_picker(&scene.outputs, layout, a);
+            }
         }
-        if in_alpha > 0.0 {
-            canvas.dy = (1.0 - raw) * PAGE_SLIDE;
-            canvas.control_center(&scene.controls, layout.left, layout.width, expanded_alpha * in_alpha);
+        if raw > 0.0 {
+            canvas.dy = -(1.0 - raw) * PAGE_TRAVEL;
+            canvas.control_center(&scene.controls, layout.left, layout.width, expanded_alpha);
         }
         canvas.dy = 0.0;
         canvas.page_dots(layout.left + layout.width - 10.0, p, expanded_alpha);
@@ -488,6 +593,7 @@ fn background(
     path: &Path,
     ts: Transform,
     height: f32,
+    shift: f32,
     media: Option<&NowPlaying>,
     transition: Option<&Transition>,
     alpha: f32,
@@ -497,15 +603,22 @@ fn background(
     let mut paint_gradient = |tint: Rgb, a: f32| {
         let alpha = (a * 255.0) as u8;
         let black = Color::from_rgba8(0, 0, 0, alpha);
+        let clear = Color::from_rgba8(tint[0], tint[1], tint[2], 0);
         let tint = Color::from_rgba8(tint[0], tint[1], tint[2], alpha);
+        // Moves with the page; outside it (the other page scrolling in) is
+        // left clear.
+        let span = height + 2.0;
+        let (start, end) = (1.0 / span, (height + 1.0) / span);
         let shader = LinearGradient::new(
-            Point::from_xy(0.0, 0.0),
-            Point::from_xy(0.0, height),
+            Point::from_xy(0.0, shift - 1.0),
+            Point::from_xy(0.0, shift + height + 1.0),
             // Solid black across the top third, where the notch meets the bezel.
             vec![
-                GradientStop::new(0.0, black),
-                GradientStop::new(0.3, black),
-                GradientStop::new(1.0, tint),
+                GradientStop::new(0.0, clear),
+                GradientStop::new(start, black),
+                GradientStop::new(start + 0.3 * height / span, black),
+                GradientStop::new(end, tint),
+                GradientStop::new(1.0, clear),
             ],
             SpreadMode::Pad,
             Transform::identity(),
@@ -555,14 +668,35 @@ pub fn button_at(
         (Button::Media(Command::Previous), PREVIOUS_X),
         (Button::Media(Command::TogglePlayPause), PLAY_X),
         (Button::Media(Command::Next), NEXT_X),
+        (Button::Output, OUTPUT_BUTTON_X),
     ]
     .into_iter()
     .find(|&(_, cx)| (x - left - cx).hypot(y - CONTROLS_Y) <= BUTTON_HIT_RADIUS)
     .map(|(button, _)| button)
 }
 
+/// Left and right ends of the output picker's rows in an open notch at
+/// `left`, `width` wide; clear of the page dots.
+fn output_row_span(left: f32, width: f32) -> (f32, f32) {
+    (left + 16.0, left + width - 24.0)
+}
+
+/// Which output picker row is under a point in physical canvas pixels;
+/// `None` off the rows (which closes the picker).
+pub fn output_at(canvas_width: u32, scale: f32, panel_width: f32, scroll: f32, count: usize, (x, y): (f32, f32)) -> Option<usize> {
+    let (x, y) = (x / scale, y / scale);
+    let left = (canvas_width as f32 / scale - panel_width) / 2.0;
+    let (x0, x1) = output_row_span(left, panel_width);
+    let bottom = OUTPUT_TOP + OUTPUT_ROW_H * OUTPUT_ROWS_SHOWN as f32;
+    if x < x0 || x > x1 || y < OUTPUT_TOP || y >= bottom {
+        return None;
+    }
+    let index = ((y - OUTPUT_TOP) / OUTPUT_ROW_H + scroll).floor();
+    (index >= 0.0 && (index as usize) < count).then_some(index as usize)
+}
+
 /// How far (logical px) a page travels while sliding in or out.
-const PAGE_SLIDE: f32 = 56.0;
+const PAGE_TRAVEL: f32 = EXPANDED.height;
 
 // Control Center layout, relative to the open notch's left edge, after iOS:
 // a connectivity module with four round toggles, two tall sliders, and on
@@ -693,6 +827,30 @@ pub fn progress_at(
     Some(((x - x0) / (x1 - x0)).clamp(0.0, 1.0))
 }
 
+/// Which synced lyric line (index into `line_count` lines) is under a point
+/// in physical canvas pixels, with the lyrics scrolled to `scroll`.
+pub fn lyric_at(
+    canvas_width: u32,
+    scale: f32,
+    panel_width: f32,
+    lyrics_reveal: f32,
+    scroll: f32,
+    line_count: usize,
+    (x, y): (f32, f32),
+) -> Option<usize> {
+    let (x, y) = (x / scale, y / scale);
+    let layout = Layout::new(canvas_width as f32 / scale, panel_width, lyrics_reveal);
+    let in_panel = x >= layout.left + layout.player && x <= layout.left + layout.width;
+    // Only the visible part of the panel, where lines have not faded out.
+    if layout.lyrics < 0.9 || !in_panel || !(18.0..=EXPANDED.height - 8.0).contains(&y) {
+        return None;
+    }
+    // Lines sit on their baselines; their text is centered ~5 px above.
+    let d = (y - (LYRIC_CURRENT_BASELINE - 5.0)) / LYRIC_LINE_H;
+    let index = (scroll + d).round();
+    (index >= 0.0 && (index as usize) < line_count).then_some(index as usize)
+}
+
 /// "mm:ss", or "h:mm:ss" past an hour.
 fn format_time(d: Duration) -> String {
     let s = d.as_secs();
@@ -725,6 +883,23 @@ fn notch_path(canvas_w: f32, shape: Shape) -> Option<Path> {
     pb.quad_to(x + w, 0.0, x + w + s, 0.0);
     pb.close();
     pb.finish()
+}
+
+const TOAST_ICON: f32 = 44.0;
+
+/// Where things sit on a notification card between `left` and `right`.
+struct ToastLayout {
+    icon_x: f32,
+    icon_y: f32,
+    text_x: f32,
+    text_right: f32,
+}
+
+impl ToastLayout {
+    fn new(left: f32, right: f32) -> Self {
+        let (icon_x, icon_y) = (left + 20.0, 25.0);
+        Self { icon_x, icon_y, text_x: icon_x + TOAST_ICON + 14.0, text_right: right - 22.0 }
+    }
 }
 
 /// Cubic Bezier approximation of a quarter circle.
@@ -971,7 +1146,8 @@ impl Canvas<'_> {
     fn page_dots(&mut self, x: f32, page: f32, alpha: f32) {
         for (i, y) in [70.0, 80.0].into_iter().enumerate() {
             // Brightness follows the slide, so the dots cross over with it.
-            let current = if i == 0 { 1.0 - page } else { page };
+            // Top dot: Control Center, the page above.
+            let current = if i == 0 { page } else { 1.0 - page };
             if let Some(dot) = PathBuilder::from_circle(x, y, 2.5) {
                 self.fill(&dot, WHITE, alpha * (0.3 + 0.6 * current));
             }
@@ -1063,6 +1239,7 @@ impl Canvas<'_> {
         transition: Option<&Transition>,
         battery: Option<Battery>,
         bluetooth: Option<DeviceKind>,
+        clock: f32,
         left: f32,
         right: f32,
         alpha: f32,
@@ -1090,7 +1267,17 @@ impl Canvas<'_> {
                 Some(_) => left + 12.0,
                 None => right - 27.0,
             };
-            for (i, h) in [8.0, 14.0, 10.0].into_iter().enumerate() {
+            for (i, rest) in [8.0, 14.0, 10.0].into_iter().enumerate() {
+                // While playing, each bar mixes two waves at its own rates so
+                // the bounce never visibly repeats; paused, they hold still.
+                let h = if np.playing {
+                    let f = i as f32;
+                    let wave = (clock * (7.0 + f * 1.9) + f * 2.1).sin() * 0.6
+                        + (clock * (11.3 - f * 2.3) + f * 0.7).sin() * 0.4;
+                    9.0 + 6.0 * wave
+                } else {
+                    rest
+                };
                 let x = x0 + i as f32 * 5.0;
                 if let Some(bar) = rounded_rect(x, mid - h / 2.0, 3.0, h, 1.5) {
                     self.fill(&bar, color, alpha * phase.alpha);
@@ -1237,39 +1424,65 @@ impl Canvas<'_> {
         }
     }
 
-    /// iOS banner: app icon, sender in bold with "now", up to two lines of
-    /// message.
+    /// iOS banner: a glow in the app's color behind its icon, the app's
+    /// name, the sender in bold, and up to two lines of message.
     fn toast_alert(&mut self, toast: &Toast, left: f32, right: f32, alpha: f32) {
         let Some(fonts) = self.fonts else { return };
-        let h = TOAST_ALERT.height;
-        let icon = 40.0;
-        let (icon_x, icon_y) = (left + 20.0, (h - icon) / 2.0 + 2.0);
+        let l = ToastLayout::new(left, right);
+        let accent = toast.tint.map_or(GRAY, vivid);
+        self.glow(left, right, TOAST_ALERT.height, accent, alpha);
+
         match &toast.icon {
-            Some(pixmap) => self.art(pixmap, icon_x, icon_y, icon, 10.0, alpha, 1.0),
+            Some(pixmap) if toast.icon_is_tile => self.art(pixmap, l.icon_x, l.icon_y, TOAST_ICON, 11.0, alpha, 1.0),
+            // A bare glyph (WhatsApp's): on a dark tile washed in its color.
+            Some(pixmap) => {
+                if let Some(tile) = rounded_rect(l.icon_x, l.icon_y, TOAST_ICON, TOAST_ICON, 11.0) {
+                    self.fill(&tile, [30, 30, 32], alpha);
+                    self.fill(&tile, accent, alpha * 0.2);
+                }
+                let glyph = TOAST_ICON * 0.68;
+                let inset = (TOAST_ICON - glyph) / 2.0;
+                self.art(pixmap, l.icon_x + inset, l.icon_y + inset, glyph, 0.0, alpha, 1.0);
+            }
             None => {
-                // No logo from Windows: a grey tile with the app's initial.
-                if let Some(tile) = rounded_rect(icon_x, icon_y, icon, icon, 10.0) {
-                    self.fill(&tile, [70, 70, 76], alpha);
+                // No logo from Windows: a tile in the app's color with its initial.
+                if let Some(tile) = rounded_rect(l.icon_x, l.icon_y, TOAST_ICON, TOAST_ICON, 11.0) {
+                    self.fill(&tile, if toast.tint.is_some() { accent } else { [70, 70, 76] }, alpha);
                 }
                 let initial: String = toast.app.chars().take(1).collect::<String>().to_uppercase();
-                let baseline = icon_y + icon / 2.0 + 6.5;
-                self.text_centered(&fonts.semibold, &initial, 18.0, icon_x + icon / 2.0, baseline, WHITE, alpha);
+                let baseline = l.icon_y + TOAST_ICON / 2.0 + 7.0;
+                self.text_centered(&fonts.bold, &initial, 19.0, l.icon_x + TOAST_ICON / 2.0, baseline, WHITE, alpha);
             }
         }
 
-        let x = icon_x + icon + 12.0;
-        let text_right = right - 22.0;
         let px = self.scale;
-        let now_w = text_width(&fonts.regular, "now", 12.0 * px) / px;
-        let body_w = text_right - x;
-        let body = wrap(&fonts.regular, &toast.body, 13.0 * px, body_w * px, 2);
-        // With a one-line message the pair sits a little lower, centered.
-        let title_baseline = if body.len() > 1 { 36.0 } else { 44.0 };
-        self.text(&fonts.semibold, &toast.title, 14.0, x, title_baseline, body_w - now_w - 8.0, WHITE, alpha);
-        self.text_right(&fonts.regular, "now", 12.0, text_right, title_baseline, GRAY, alpha * 0.8);
+        let width = l.text_right - l.text_x;
+        let now_w = text_width(&fonts.semibold, "now", 11.5 * px) / px;
+        self.text(&fonts.semibold, &toast.app, 11.5, l.text_x, 32.0, width - now_w - 8.0, DIM, alpha);
+        self.text_right(&fonts.semibold, "now", 11.5, l.text_right, 32.0, DIM, alpha);
+        self.text(&fonts.bold, &toast.title, 14.5, l.text_x, 49.0, width, WHITE, alpha);
+        let body = wrap(&fonts.regular, &toast.body, 13.0 * px, width * px, 1);
         for (i, line) in body.iter().enumerate() {
-            let baseline = title_baseline + 18.0 + i as f32 * 17.0;
-            self.text(&fonts.regular, line, 13.0, x, baseline, body_w, [225, 225, 225], alpha);
+            self.text(&fonts.regular, line, 13.0, l.text_x, 65.0 + i as f32 * 17.0, width, [215, 215, 215], alpha);
+        }
+
+    }
+
+    /// A wash of `rgb` from the card's left edge, fading out to the right.
+    fn glow(&mut self, left: f32, right: f32, height: f32, rgb: Rgb, alpha: f32) {
+        let Some(rect) = Rect::from_xywh(left, 0.0, right - left, height) else { return };
+        let color = |a: f32| Color::from_rgba8(rgb[0], rgb[1], rgb[2], (a * alpha * 255.0) as u8);
+        let shader = LinearGradient::new(
+            Point::from_xy(left, 0.0),
+            Point::from_xy(left + (right - left) * 0.7, 0.0),
+            vec![GradientStop::new(0.0, color(0.38)), GradientStop::new(0.45, color(0.12)), GradientStop::new(1.0, color(0.0))],
+            SpreadMode::Pad,
+            Transform::identity(),
+        );
+        if let Some(shader) = shader {
+            let paint = Paint { shader, anti_alias: true, ..Default::default() };
+            let ts = self.transform();
+            self.pixmap.fill_path(&PathBuilder::from_rect(rect), &paint, FillRule::Winding, ts, Some(self.clip));
         }
     }
 
@@ -1448,6 +1661,139 @@ impl Canvas<'_> {
         }
     }
 
+    /// AirPlay-style: rings open at the bottom over a triangle.
+    fn output_button(&mut self, cx: f32, cy: f32, alpha: f32) {
+        for r in [8.0, 4.0] {
+            if let Some(ring) = arc(cx, cy - 1.5, r, 130.0, 280.0) {
+                self.stroke(&ring, 1.8, WHITE, alpha);
+            }
+        }
+        let mut pb = PathBuilder::new();
+        pb.move_to(cx - 5.5, cy + 9.0);
+        pb.line_to(cx + 5.5, cy + 9.0);
+        pb.line_to(cx, cy + 3.0);
+        pb.close();
+        if let Some(triangle) = pb.finish() {
+            self.fill(&triangle, WHITE, alpha);
+        }
+    }
+
+    /// The output devices, one row each, the current one highlighted and
+    /// ticked.
+    /// The output picker: a sheet that grows out of the AirPlay button
+    /// (overshooting a touch, on a spring) into a panel over the player,
+    /// uncovering the device rows as it goes; it shrinks back into the
+    /// button to close.
+    fn output_picker(&mut self, view: &OutputsView, layout: Layout, alpha: f32) {
+        // A springy reveal can dip below 0 or pass 1 for a moment.
+        let r = view.reveal.max(0.0);
+        let (x0, x1) = output_row_span(layout.left, layout.width);
+        let bottom = OUTPUT_TOP + OUTPUT_ROW_H * OUTPUT_ROWS_SHOWN as f32;
+        let (bx, by) = (layout.left + layout.controls_dx() + OUTPUT_BUTTON_X, CONTROLS_Y);
+        let lerp = |from: f32, to: f32| from + (to - from) * r;
+        let half = SHEET_FROM / 2.0;
+        let (l, t) = (lerp(bx - half, x0 - SHEET_PAD), lerp(by - half, OUTPUT_TOP - SHEET_PAD));
+        let (rt, b) = (lerp(bx + half, x1 + SHEET_PAD), lerp(by + half, bottom + SHEET_PAD / 2.0));
+        let radius = lerp(half, SHEET_RADIUS);
+        let Some(sheet) = rounded_rect(l, t, rt - l, b - t, radius) else { return };
+        self.fill(&sheet, SHEET_RGB, alpha * (r * 4.0).min(1.0));
+        // The button's glyph melts into the sheet.
+        let glyph = (1.0 - r * 3.0).clamp(0.0, 1.0);
+        if glyph > 0.0 {
+            self.output_button(bx, by, alpha * glyph);
+        }
+
+        // Rows show only inside the sheet, and fade in once it is nearly
+        // full size, so none shows cut off by its growing edge.
+        let rows = ((r - 0.85) / 0.15).clamp(0.0, 1.0);
+        if rows <= 0.0 {
+            return;
+        }
+        let mut clip = self.clip.clone();
+        clip.intersect_path(&sheet, FillRule::Winding, true, self.transform());
+        let mut inner = Canvas { pixmap: &mut *self.pixmap, clip: &clip, scale: self.scale, fonts: self.fonts, dy: self.dy };
+        // Rows settle a few px up into place as they appear.
+        inner.dy += (1.0 - ease_out_cubic(rows)) * 8.0;
+        inner.output_rows(view, layout, alpha * rows);
+    }
+
+    /// The device rows: the current one highlighted and ticked (the
+    /// highlight slides to a new pick), a softer highlight under the
+    /// pointer, a brighter one while pressed.
+    fn output_rows(&mut self, view: &OutputsView, layout: Layout, alpha: f32) {
+        let Some(fonts) = self.fonts else { return };
+        let (x0, x1) = output_row_span(layout.left, layout.width);
+        let bottom = OUTPUT_TOP + OUTPUT_ROW_H * OUTPUT_ROWS_SHOWN as f32;
+        let row_y = |row: f32| OUTPUT_TOP + (row - view.scroll) * OUTPUT_ROW_H;
+        // Rows scrolling past the top or bottom fade out.
+        let inside = |y: f32| ((y - OUTPUT_TOP) / OUTPUT_ROW_H + 1.0).min((bottom - y) / OUTPUT_ROW_H).clamp(0.0, 1.0);
+        let highlight = |canvas: &mut Self, row: f32, strength: f32| {
+            let y = row_y(row);
+            let a = alpha * strength * inside(y);
+            if a > 0.0 {
+                if let Some(rect) = rounded_rect(x0, y + 1.0, x1 - x0, OUTPUT_ROW_H - 2.0, 10.0) {
+                    canvas.fill(&rect, WHITE, a);
+                }
+            }
+        };
+        if !view.list.is_empty() {
+            highlight(self, view.highlight, 0.1);
+            highlight(self, view.hover, 0.06 * view.hover_alpha);
+            if let Some(row) = view.pressed {
+                highlight(self, row as f32, 0.08);
+            }
+        }
+
+        for (i, output) in view.list.iter().enumerate() {
+            let y = row_y(i as f32);
+            let a = alpha * inside(y);
+            if a <= 0.0 {
+                continue;
+            }
+            let mid = y + OUTPUT_ROW_H / 2.0;
+            // How close the highlight is to this row: the check and the
+            // bold name follow it.
+            let picked = (1.0 - (view.highlight - i as f32).abs()).clamp(0.0, 1.0);
+            self.output_icon(output.kind, x0 + 18.0, mid, a);
+            let font = if picked > 0.5 { &fonts.semibold } else { &fonts.regular };
+            let rgb = lerp_rgb([220, 220, 220], WHITE, picked);
+            self.text(font, &output.name, 13.0, x0 + 38.0, mid + 4.5, x1 - x0 - 38.0 - 32.0, rgb, a);
+            if picked > 0.0 {
+                // Grows in from its center.
+                let (cx, s) = (x1 - 16.0, ease_out_back(picked));
+                let mut pb = PathBuilder::new();
+                pb.move_to(cx - 5.0 * s, mid + 0.5 * s);
+                pb.line_to(cx - 1.5 * s, mid + 4.0 * s);
+                pb.line_to(cx + 5.0 * s, mid - 4.0 * s);
+                if let Some(check) = pb.finish() {
+                    self.stroke(&check, 2.0, BLUE, a * picked);
+                }
+            }
+        }
+        if view.list.is_empty() {
+            let center = layout.left + layout.width / 2.0;
+            self.text_centered(&fonts.semibold, "No audio outputs", 13.0, center, 80.0, DIM, alpha);
+        }
+    }
+
+    fn output_icon(&mut self, kind: OutputKind, cx: f32, cy: f32, alpha: f32) {
+        match kind {
+            OutputKind::Headphones => self.device_icon(DeviceKind::Headphones, cx, cy, alpha),
+            OutputKind::Speaker => self.speaker_icon(cx - 8.0, cy, 0.7, false, alpha),
+            OutputKind::Display => {
+                if let Some(screen) = rounded_rect(cx - 8.0, cy - 6.5, 16.0, 11.0, 2.0) {
+                    self.stroke(&screen, 1.6, WHITE, alpha);
+                }
+                let mut pb = PathBuilder::new();
+                pb.move_to(cx - 4.0, cy + 7.5);
+                pb.line_to(cx + 4.0, cy + 7.5);
+                if let Some(stand) = pb.finish() {
+                    self.stroke(&stand, 1.6, WHITE, alpha);
+                }
+            }
+        }
+    }
+
     fn expanded(
         &mut self,
         media: Option<&NowPlaying>,
@@ -1491,11 +1837,11 @@ impl Canvas<'_> {
                 }
                 Some(np) => {
                     let x = left + TEXT_X;
-                    let max = layout.player - TEXT_X - TEXT_RIGHT_PAD;
+                    let max = layout.player - TEXT_X - TEXT_RIGHT_PAD - layout.dots_clearance();
                     let title = TITLE_BASELINE + phase.dy;
                     let subtitle = SUBTITLE_BASELINE + phase.dy;
-                    self.text(&fonts.semibold, &np.title, TITLE_SIZE, x, title, max, WHITE, a);
-                    self.text(&fonts.regular, &np.subtitle(), SUBTITLE_SIZE, x, subtitle, max, GRAY, a);
+                    self.text(&fonts.extrabold, &np.title, TITLE_SIZE, x, title, max, WHITE, a);
+                    self.text(&fonts.bold, &np.subtitle(), SUBTITLE_SIZE, x, subtitle, max, GRAY, a);
                 }
             }
         }
@@ -1516,6 +1862,7 @@ impl Canvas<'_> {
                 self.play_icon(controls + PLAY_X, CONTROLS_Y, a);
             }
             self.skip_icon(controls + NEXT_X, CONTROLS_Y, true, a);
+            self.output_button(controls + OUTPUT_BUTTON_X, CONTROLS_Y, a);
 
             let a = a * layout.lyrics;
             if a > 0.0 {
@@ -1590,7 +1937,8 @@ impl Canvas<'_> {
             None => ("--:--".to_owned(), "--:--".to_owned(), 0.0),
         };
         self.text(&fonts.regular, &elapsed, 14.0, left + TIME_LEFT, TIME_BASELINE, PANEL_W, WHITE, alpha);
-        self.text_right(&fonts.regular, &remaining, 14.0, right - TIME_RIGHT_INSET, TIME_BASELINE, WHITE, alpha);
+        let time_right = right - TIME_RIGHT_INSET - layout.dots_clearance();
+        self.text_right(&fonts.regular, &remaining, 14.0, time_right, TIME_BASELINE, WHITE, alpha);
 
         let (x0, x1) = layout.progress_span();
         let x = x0 + (x1 - x0) * fraction.clamp(0.0, 1.0);
@@ -1783,14 +2131,34 @@ mod tests {
     use crate::media::{Artwork, Timeline};
     use crate::palette;
 
+    #[test]
+    fn finds_the_tapped_lyric_line() {
+        // A 600 px canvas at 1x, lyrics open, line 5 being sung.
+        let at = |x: f32, y: f32| lyric_at(600, 1.0, EXPANDED.width, 1.0, 5.0, 20, (x, y));
+        let panel_x = (600.0 - EXPANDED.width) / 2.0 + PANEL_W + 40.0;
+        let current = LYRIC_CURRENT_BASELINE - 5.0;
+        assert_eq!(at(panel_x, current), Some(5));
+        assert_eq!(at(panel_x, current + LYRIC_LINE_H), Some(6));
+        assert_eq!(at(panel_x, current - LYRIC_LINE_H), Some(4));
+        // The player side is not lyrics.
+        assert_eq!(at(panel_x - PANEL_W, current), None);
+        // Past the last line.
+        assert_eq!(lyric_at(600, 1.0, EXPANDED.width, 1.0, 19.0, 20, (panel_x, current + LYRIC_LINE_H)), None);
+    }
+
     fn save_preview(scene: &Scene, name: &str) {
         let scale = 2.0;
         let mut notch = Pixmap::new((600.0 * scale) as u32, (200.0 * scale) as u32).unwrap();
         draw(&mut notch, scale, scene, Fonts::load().as_ref());
 
-        // Over a light desktop-like backdrop so the shape is visible.
+        // Over a light desktop-like backdrop so the shape is visible, with
+        // the shadow window's content beneath.
         let mut out = Pixmap::new(notch.width(), notch.height()).unwrap();
         out.fill(Color::from_rgba8(225, 228, 235, 255));
+        let pad = (SHADOW_PAD * scale) as u32;
+        let mut shadow = Pixmap::new(notch.width() + 2 * pad, notch.height() + pad).unwrap();
+        draw_shadow(&mut shadow, scale, scene.shape);
+        out.draw_pixmap(-(pad as i32), 0, shadow.as_ref(), &Default::default(), Transform::identity(), None);
         out.draw_pixmap(0, 0, notch.as_ref(), &Default::default(), Transform::identity(), None);
         out.save_png(format!("{}/target/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap();
     }
@@ -1848,6 +2216,8 @@ mod tests {
                 bluetooth: None,
                 alert: None,
                 alert_from: None,
+                clock: 0.0,
+                outputs: OutputsView::default(),
                 page: 0.0,
                 controls: ControlsView::default(),
             },
@@ -1872,6 +2242,8 @@ mod tests {
                 bluetooth: None,
                 alert: None,
                 alert_from: None,
+                clock: 0.0,
+                outputs: OutputsView::default(),
                 page: 0.0,
                 controls: ControlsView::default(),
             },
@@ -1905,9 +2277,35 @@ mod tests {
             bluetooth: None,
             alert: None,
             alert_from: None,
+            clock: 0.0,
+            outputs: OutputsView::default(),
             page,
             controls,
         };
+        // The output picker over the player, the laptop speakers current.
+        let outputs = [
+            ("Speakers (Realtek(R) Audio)", OutputKind::Speaker, true),
+            ("Mi Monitor (NVIDIA High Definition Audio)", OutputKind::Display, false),
+            ("Headphones (Realtek(R) Audio)", OutputKind::Headphones, false),
+            ("Galaxy Buds2 Pro", OutputKind::Headphones, false),
+            ("System (Elgato Virtual Audio)", OutputKind::Speaker, false),
+            ("Discord (Elgato Virtual Audio)", OutputKind::Speaker, false),
+        ]
+        .map(|(name, kind, default)| Output { id: name.into(), name: name.into(), kind, default });
+        let picker = |reveal: f32| Scene {
+            outputs: OutputsView { list: &outputs, reveal, highlight: 0.0, ..Default::default() },
+            ..page(EXPANDED.width, 0.0)
+        };
+        save_preview(&picker(1.0), "preview_outputs.png");
+        save_preview(&picker(0.15), "preview_outputs_opening_a.png");
+        save_preview(&picker(0.45), "preview_outputs_opening_b.png");
+        save_preview(&picker(0.75), "preview_outputs_opening_c.png");
+        // The highlight on its way from the speakers to the monitor.
+        let sliding = Scene {
+            outputs: OutputsView { list: &outputs, reveal: 1.0, highlight: 0.6, hover: 1.0, hover_alpha: 1.0, ..Default::default() },
+            ..page(EXPANDED.width, 0.0)
+        };
+        save_preview(&sliding, "preview_outputs_picking.png");
         save_preview(&page(EXPANDED.width, 1.0), "preview_controls.png");
         save_preview(&page(PLAYER_ONLY_WIDTH, 1.0), "preview_controls_narrow.png");
         save_preview(&page(EXPANDED.width, 0.5), "preview_controls_sliding.png");
@@ -1925,6 +2323,8 @@ mod tests {
             bluetooth: Some(DeviceKind::Headphones),
             alert,
             alert_from: None,
+            clock: 0.0,
+            outputs: OutputsView::default(),
             page: 0.0,
             controls: ControlsView::default(),
         };
@@ -1958,10 +2358,33 @@ mod tests {
                    jangan telat ya soalnya cuma dapet dua jam"
                 .into(),
             icon: None,
+            icon_is_tile: false,
             app_id: String::new(),
+            tint: Some([37, 211, 102]),
+        };
+        // As Windows hands over WhatsApp's logo: a small green glyph in a
+        // wide transparent margin.
+        let mut logo = Pixmap::new(128, 128).unwrap();
+        let mut green = Paint::default();
+        green.set_color_rgba8(37, 211, 102, 255);
+        green.anti_alias = true;
+        let ring = PathBuilder::from_circle(64.0, 64.0, 26.0).unwrap();
+        let stroke = Stroke { width: 7.0, ..Default::default() };
+        logo.stroke_path(&ring, &green, &stroke, Transform::identity(), None);
+        let logo = crate::notifications::trim(&logo);
+        let glyph_toast = Toast {
+            title: "Indosat".into(),
+            body: "oy".into(),
+            icon_is_tile: crate::notifications::is_tile(&logo),
+            icon: Some(logo),
+            app: toast.app.clone(),
+            app_id: String::new(),
+            tint: toast.tint,
         };
         let toast = Alert::Toast(Arc::new(toast));
         save_preview(&small(TOAST_ALERT, on_battery, Some(toast)), "preview_toast.png");
+        let glyph_toast = Alert::Toast(Arc::new(glyph_toast));
+        save_preview(&small(TOAST_ALERT, on_battery, Some(glyph_toast)), "preview_toast_glyph.png");
         // A new track, 0.4 s in, the equalizer mid-bounce.
         let started = Instant::now() - Duration::from_millis(400);
         let now_playing = Alert::NowPlaying { track: Box::new(np.clone()), since: started };
