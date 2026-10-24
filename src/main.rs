@@ -2,20 +2,23 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod anim;
-mod appbar;
 mod autostart;
 mod battery;
 mod bluetooth;
 mod controls;
+mod font;
 #[cfg(test)]
 mod icon;
 mod lyrics;
 mod media;
+#[cfg(test)]
+mod memory;
 mod notifications;
 mod palette;
 mod render;
 mod tray;
 mod volume;
+mod volume_keys;
 mod window;
 
 fn main() -> windows::core::Result<()> {

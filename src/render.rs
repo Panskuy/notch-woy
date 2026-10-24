@@ -5,9 +5,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use fontdue::{Font, FontSettings, Metrics};
+use crate::font::{Font, Glyph};
 use tiny_skia::{
     Color, FillRule, FilterQuality, GradientStop, LineCap, LineJoin, LinearGradient, Mask, Paint,
     Path, PathBuilder, Pattern, Pixmap, Point, Rect, SpreadMode, Stroke, Transform,
@@ -56,8 +56,12 @@ pub fn alert_shape(alert: &Alert) -> Shape {
         Alert::Volume { .. } => VOLUME_ALERT,
         Alert::Toast(_) => TOAST_ALERT,
         Alert::Bluetooth { .. } => BLUETOOTH_ALERT,
+        Alert::NowPlaying { .. } => NOW_PLAYING_ALERT,
     }
 }
+
+/// A new track: cover, title and artist, with a live equalizer.
+pub const NOW_PLAYING_ALERT: Shape = Shape { width: 360.0, height: 64.0, radius: 26.0 };
 
 /// Concave curve joining the notch sides to the top edge of the screen.
 const SHOULDER: f32 = 8.0;
@@ -108,6 +112,13 @@ const GREEN: Rgb = [48, 209, 88];
 const YELLOW: Rgb = [255, 214, 10];
 const RED: Rgb = [255, 69, 58];
 
+/// The cover tint, which is muted for backgrounds, brightened enough to
+/// read as a color on black.
+fn vivid(rgb: Rgb) -> Rgb {
+    let max = rgb.into_iter().max().unwrap_or(0).max(1) as f32;
+    rgb.map(|c| ((c as f32 / max) * 235.0).round() as u8)
+}
+
 /// Battery capsule width over height.
 const BATTERY_ASPECT: f32 = 2.15;
 
@@ -126,7 +137,7 @@ pub struct Fonts {
     semibold: Font,
     /// Rasterized glyphs by (font, char, pixel size). Text is redrawn every
     /// animation frame, so rasterizing each time would dominate the frame.
-    glyphs: RefCell<HashMap<(bool, char, u32), Rc<(Metrics, Vec<u8>)>>>,
+    glyphs: RefCell<HashMap<(bool, char, u32), Rc<Glyph>>>,
 }
 
 /// Plenty for a few sizes of a few scripts; cleared rather than evicted.
@@ -136,10 +147,7 @@ impl Fonts {
     /// Loads Segoe UI from the system font folder.
     pub fn load() -> Option<Self> {
         let dir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
-        let load = |name: &str| -> Option<Font> {
-            let bytes = std::fs::read(format!(r"{dir}\Fonts\{name}")).ok()?;
-            Font::from_bytes(bytes, FontSettings::default()).ok()
-        };
+        let load = |name: &str| Font::load(&format!(r"{dir}\Fonts\{name}"));
         Some(Self {
             regular: load("segoeui.ttf")?,
             semibold: load("seguisb.ttf").or_else(|| load("segoeuib.ttf"))?,
@@ -148,7 +156,7 @@ impl Fonts {
     }
 
     /// `font` must be one of this set's fonts.
-    fn glyph(&self, font: &Font, ch: char, px: f32) -> Rc<(Metrics, Vec<u8>)> {
+    fn glyph(&self, font: &Font, ch: char, px: f32) -> Rc<Glyph> {
         let key = (std::ptr::eq(font, &self.semibold), ch, px.to_bits());
         let mut glyphs = self.glyphs.borrow_mut();
         if let Some(glyph) = glyphs.get(&key) {
@@ -182,6 +190,8 @@ pub struct Scene<'a> {
     /// connected.
     pub bluetooth: Option<DeviceKind>,
     pub alert: Option<Alert>,
+    /// The alert `alert` is replacing, and how far (0..1) the swap is.
+    pub alert_from: Option<(Alert, f32)>,
     /// Open notch page, animated: 0 = player, 1 = Control Center.
     pub page: f32,
     pub controls: ControlsView<'a>,
@@ -196,8 +206,14 @@ pub struct ControlsView<'a> {
     pub muted: bool,
     /// 0..1, overriding the reported brightness while its slider is dragged.
     pub brightness: Option<f32>,
-    pub bluetooth_device: Option<&'a str>,
+    pub bluetooth_device: Option<&'a Device>,
     pub battery: Option<Battery>,
+    pub media: Option<&'a NowPlaying>,
+    /// Per toggle (`Toggle::index` order), how far it is shown switched on
+    /// (0..1); animates between off and on colors.
+    pub toggle_on: [f32; 4],
+    /// Per toggle, its size (1 at rest, smaller while pressed).
+    pub toggle_scale: [f32; 4],
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -206,6 +222,25 @@ pub enum Toggle {
     Wifi,
     Bluetooth,
     Mute,
+}
+
+impl Toggle {
+    pub const ALL: [Toggle; 4] = [Toggle::Airplane, Toggle::Mute, Toggle::Wifi, Toggle::Bluetooth];
+
+    /// Position in `ALL` and in `ControlsView`'s per-toggle arrays.
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|&t| t == self).expect("listed")
+    }
+
+    /// Whether it is switched on, for these readings.
+    pub fn is_on(self, state: &ControlState, muted: bool) -> bool {
+        match self {
+            Toggle::Airplane => state.airplane(),
+            Toggle::Wifi => state.wifi == Some(true),
+            Toggle::Bluetooth => state.bluetooth == Some(true),
+            Toggle::Mute => muted,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -220,6 +255,8 @@ pub enum ControlHit {
     Toggle(Toggle),
     /// With the value (0..1) at the pointer.
     Slider(Slider, f32),
+    /// The play/pause button on the Now Playing module.
+    PlayPause,
 }
 
 /// A brief notification, shown in its `alert_shape`.
@@ -231,6 +268,8 @@ pub enum Alert {
     /// A toast from another app (WhatsApp, mail...).
     Toast(Arc<Toast>),
     Bluetooth { device: Device, connected: bool },
+    /// A new track started; `since` drives the equalizer animation.
+    NowPlaying { track: Box<NowPlaying>, since: Instant },
 }
 
 pub enum LyricsView<'a> {
@@ -379,8 +418,12 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
     // into its range (a notification card) keeps them hidden.
     let t = expansion(shape);
     let expanded_alpha = ((t - 0.35) / 0.65).clamp(0.0, 1.0) * (1.0 - alert_alpha);
-    if expanded_alpha > 0.0 {
-        background(pixmap, &path, ts, shape.height, media, transition, expanded_alpha);
+    // The cover gradient belongs to the music page with lyrics showing; it
+    // fades with the lyrics panel and as the page scrolls away.
+    let page = scene.page.clamp(0.0, 1.0);
+    let gradient_alpha = expanded_alpha * scene.lyrics_reveal.clamp(0.0, 1.0) * (1.0 - page);
+    if gradient_alpha > 0.0 {
+        background(pixmap, &path, ts, shape.height, media, transition, gradient_alpha);
     }
 
     // Content is clipped to the notch so it is revealed as the shape grows.
@@ -399,7 +442,19 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
     }
 
     if let Some(alert) = scene.alert.as_ref().filter(|_| alert_alpha > 0.0) {
-        canvas.alert(alert, left, right, alert_alpha);
+        match &scene.alert_from {
+            // Old content drifts up and fades, the new rises in after it,
+            // like the track change.
+            Some((from, p)) => {
+                let (out, incoming) = (Phase::outgoing(*p), Phase::incoming(*p));
+                canvas.dy = out.dy;
+                canvas.alert(from, left, right, alert_alpha * out.alpha);
+                canvas.dy = incoming.dy;
+                canvas.alert(alert, left, right, alert_alpha * incoming.alpha);
+                canvas.dy = 0.0;
+            }
+            None => canvas.alert(alert, left, right, alert_alpha),
+        }
     }
 
     if expanded_alpha > 0.0 {
@@ -407,14 +462,17 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
         // Pages slide vertically past each other, like Control Center's.
         // The old one is mostly gone before the new one shows, so the two
         // barely overlap.
-        let p = scene.page.clamp(0.0, 1.0);
+        // Positions follow the raw value, which a touchpad can stretch a
+        // little past either page (rubber band); fades use the clamped one.
+        let raw = scene.page;
+        let p = page;
         let (out_alpha, in_alpha) = (((0.6 - p) / 0.6).clamp(0.0, 1.0), ((p - 0.4) / 0.6).clamp(0.0, 1.0));
         if out_alpha > 0.0 {
-            canvas.dy = -p * PAGE_SLIDE;
+            canvas.dy = -raw * PAGE_SLIDE;
             canvas.expanded(media, transition, &scene.lyrics, scene.seek, layout, expanded_alpha * out_alpha);
         }
         if in_alpha > 0.0 {
-            canvas.dy = (1.0 - p) * PAGE_SLIDE;
+            canvas.dy = (1.0 - raw) * PAGE_SLIDE;
             canvas.control_center(&scene.controls, layout.left, layout.width, expanded_alpha * in_alpha);
         }
         canvas.dy = 0.0;
@@ -504,11 +562,11 @@ pub fn button_at(
 }
 
 /// How far (logical px) a page travels while sliding in or out.
-const PAGE_SLIDE: f32 = 36.0;
+const PAGE_SLIDE: f32 = 56.0;
 
-// Control Center layout, relative to the open notch's left edge: a
-// connectivity platter with four round toggles, two tall sliders, and an
-// info platter in what width remains.
+// Control Center layout, relative to the open notch's left edge, after iOS:
+// a connectivity module with four round toggles, two tall sliders, and on
+// the right a Now Playing module over a battery ring and a Bluetooth module.
 const CC_TOP: f32 = 12.0;
 const CC_HEIGHT: f32 = 126.0;
 const PLATTER_X: f32 = 16.0;
@@ -517,23 +575,68 @@ const TOGGLE_RADIUS: f32 = 23.0;
 const SLIDER_W: f32 = 52.0;
 const BRIGHTNESS_X: f32 = 156.0;
 const VOLUME_X: f32 = 220.0;
-const INFO_X: f32 = 286.0;
-/// Narrower than this, the info platter is left out.
-const INFO_MIN_W: f32 = 90.0;
+const MODULES_X: f32 = 286.0;
+const MODULE_GAP: f32 = 10.0;
+/// Each of the right-hand rows: Now Playing, then battery + Bluetooth.
+const MODULE_H: f32 = (CC_HEIGHT - MODULE_GAP) / 2.0;
+const MODULE_RADIUS: f32 = 20.0;
+/// Narrower than this, the right-hand modules are left out.
+const MODULES_MIN_W: f32 = 90.0;
+/// Width of the Now Playing module's play/pause hit area, at its right.
+const MEDIA_BUTTON_W: f32 = 44.0;
 
 const ORANGE: Rgb = [255, 159, 10];
 const BLUE: Rgb = [10, 132, 255];
+/// A switched-off toggle: a light grey disc on the module.
+const TOGGLE_OFF: Rgb = [62, 62, 66];
 
 /// Toggles in the platter's 2x2 grid, with their centers.
 fn toggles() -> [(Toggle, f32, f32); 4] {
     let (a, b) = (PLATTER_X + 35.0, PLATTER_X + 91.0);
     let (top, bottom) = (CC_TOP + 35.0, CC_TOP + 91.0);
-    [
-        (Toggle::Airplane, a, top),
-        (Toggle::Mute, b, top),
-        (Toggle::Wifi, a, bottom),
-        (Toggle::Bluetooth, b, bottom),
-    ]
+    let centers = [(a, top), (b, top), (a, bottom), (b, bottom)];
+    Toggle::ALL.map(|t| (t, centers[t.index()].0, centers[t.index()].1))
+}
+
+/// Width of the right-hand modules column in an open notch `width` wide.
+fn modules_width(width: f32) -> f32 {
+    width - MODULES_X - 16.0
+}
+
+/// A circular arc of radius `r` around (cx, cy), from `start` degrees (0 =
+/// right, -90 = top) sweeping `sweep` degrees clockwise.
+fn arc(cx: f32, cy: f32, r: f32, start: f32, sweep: f32) -> Option<Path> {
+    if sweep.abs() < 0.5 {
+        return None;
+    }
+    // Cubic segments of at most 90°, each with control points at
+    // 4/3 · tan(θ/4) of the radius along the tangents.
+    let segments = (sweep.abs() / 90.0).ceil() as usize;
+    let step = (sweep / segments as f32).to_radians();
+    let k = 4.0 / 3.0 * (step / 4.0).tan();
+    let mut angle = start.to_radians();
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx + r * angle.cos(), cy + r * angle.sin());
+    for _ in 0..segments {
+        let next = angle + step;
+        let (s0, c0) = angle.sin_cos();
+        let (s1, c1) = next.sin_cos();
+        pb.cubic_to(
+            cx + r * (c0 - k * s0),
+            cy + r * (s0 + k * c0),
+            cx + r * (c1 + k * s1),
+            cy + r * (s1 - k * c1),
+            cx + r * c1,
+            cy + r * s1,
+        );
+        angle = next;
+    }
+    pb.finish()
+}
+
+fn lerp_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
+    let t = t.clamp(0.0, 1.0);
+    [0, 1, 2].map(|i| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t).round() as u8)
 }
 
 /// What on the Control Center page is under a point in physical canvas
@@ -543,6 +646,12 @@ pub fn control_at(canvas_width: u32, scale: f32, panel_width: f32, (x, y): (f32,
     let (x, y) = (x / scale - left, y / scale);
     if let Some((toggle, _, _)) = toggles().into_iter().find(|&(_, cx, cy)| (x - cx).hypot(y - cy) <= TOGGLE_RADIUS) {
         return Some(ControlHit::Toggle(toggle));
+    }
+    let modules_w = modules_width(panel_width);
+    let media_right = MODULES_X + modules_w;
+    let on_media_button = x >= media_right - MEDIA_BUTTON_W && x <= media_right && y >= CC_TOP && y <= CC_TOP + MODULE_H;
+    if modules_w >= MODULES_MIN_W && on_media_button {
+        return Some(ControlHit::PlayPause);
     }
     let in_column = |x0: f32| x >= x0 && x <= x0 + SLIDER_W && y >= CC_TOP && y <= CC_TOP + CC_HEIGHT;
     let slider = if in_column(BRIGHTNESS_X) {
@@ -654,28 +763,28 @@ impl Canvas<'_> {
         Transform::from_row(self.scale, 0.0, 0.0, self.scale, 0.0, self.dy * self.scale)
     }
 
-    /// The Control Center page: connectivity platter, brightness and volume
-    /// sliders, and an info platter if there is room.
+    /// The Control Center page: connectivity module, brightness and volume
+    /// sliders, and the Now Playing, battery and Bluetooth modules if there
+    /// is room.
     fn control_center(&mut self, view: &ControlsView, left: f32, width: f32, alpha: f32) {
-        // Translucent "platters", as in Control Center.
         if let Some(platter) = rounded_rect(left + PLATTER_X, CC_TOP, PLATTER, CC_HEIGHT, 28.0) {
-            self.fill(&platter, WHITE, alpha * 0.10);
+            self.glass(&platter, alpha);
         }
         let s = view.state;
         for (toggle, cx, cy) in toggles() {
-            let (on, available, color) = match toggle {
-                Toggle::Airplane => (s.airplane(), s.wifi.is_some() || s.bluetooth.is_some(), ORANGE),
-                Toggle::Wifi => (s.wifi == Some(true), s.wifi.is_some(), BLUE),
-                Toggle::Bluetooth => (s.bluetooth == Some(true), s.bluetooth.is_some(), BLUE),
-                Toggle::Mute => (view.muted, true, RED),
+            let (available, color) = match toggle {
+                Toggle::Airplane => (s.wifi.is_some() || s.bluetooth.is_some(), ORANGE),
+                Toggle::Wifi => (s.wifi.is_some(), BLUE),
+                Toggle::Bluetooth => (s.bluetooth.is_some(), BLUE),
+                Toggle::Mute => (true, RED),
             };
+            let i = toggle.index();
             let a = alpha * if available { 1.0 } else { 0.4 };
-            if let Some(circle) = PathBuilder::from_circle(left + cx, cy, TOGGLE_RADIUS) {
-                if on {
-                    self.fill(&circle, color, a);
-                } else {
-                    self.fill(&circle, WHITE, a * 0.18);
-                }
+            // The disc eases between grey and the toggle's color, and dips
+            // in size while pressed.
+            let radius = TOGGLE_RADIUS * view.toggle_scale[i];
+            if let Some(circle) = PathBuilder::from_circle(left + cx, cy, radius) {
+                self.fill(&circle, lerp_rgb(TOGGLE_OFF, color, view.toggle_on[i]), a);
             }
             let (x, y) = (left + cx, cy);
             match toggle {
@@ -690,10 +799,125 @@ impl Canvas<'_> {
         self.slider(left + BRIGHTNESS_X, brightness, Slider::Brightness, false, alpha);
         self.slider(left + VOLUME_X, Some(view.volume), Slider::Volume, view.muted, alpha);
 
-        let info_w = width - INFO_X - 16.0;
-        if info_w >= INFO_MIN_W {
-            self.info_platter(view, left + INFO_X, info_w, alpha);
+        let modules_w = modules_width(width);
+        if modules_w >= MODULES_MIN_W {
+            let x = left + MODULES_X;
+            let lower = CC_TOP + MODULE_H + MODULE_GAP;
+            self.media_module(view.media, x, modules_w, alpha);
+            self.battery_module(view.battery, x, lower, alpha);
+            let bt_x = x + MODULE_H + MODULE_GAP;
+            self.bluetooth_module(view, bt_x, lower, modules_w - MODULE_H - MODULE_GAP, alpha);
         }
+    }
+
+    /// A Control Center module's surface: translucent, with a faint rim of
+    /// light so it reads as a raised pane of glass.
+    fn glass(&mut self, path: &Path, alpha: f32) {
+        self.fill(path, WHITE, alpha * 0.10);
+        self.stroke(path, 1.0, WHITE, alpha * 0.08);
+    }
+
+    /// Cover, title and artist, and a play/pause button; like the media
+    /// module in Control Center.
+    fn media_module(&mut self, media: Option<&NowPlaying>, x: f32, w: f32, alpha: f32) {
+        let Some(module) = rounded_rect(x, CC_TOP, w, MODULE_H, MODULE_RADIUS) else { return };
+        self.glass(&module, alpha);
+        let mid = CC_TOP + MODULE_H / 2.0;
+        let art = 38.0;
+        let art_x = x + (MODULE_H - art) / 2.0;
+        match media.and_then(|np| np.art.as_ref()) {
+            Some(a) => self.art(&a.pixmap, art_x, mid - art / 2.0, art, 9.0, alpha, 1.0),
+            None => {
+                if let Some(tile) = rounded_rect(art_x, mid - art / 2.0, art, art, 9.0) {
+                    self.fill(&tile, WHITE, alpha * 0.12);
+                }
+            }
+        }
+
+        let button_x = x + w - MEDIA_BUTTON_W / 2.0;
+        let playing = media.is_some_and(|np| np.playing);
+        let button_alpha = alpha * if media.is_some() { 1.0 } else { 0.35 };
+        if playing {
+            self.pause_icon(button_x, mid, button_alpha);
+        } else {
+            self.play_icon(button_x, mid, button_alpha);
+        }
+
+        let Some(fonts) = self.fonts else { return };
+        let text_x = art_x + art + 10.0;
+        let max = x + w - MEDIA_BUTTON_W - text_x;
+        if max < 40.0 {
+            return;
+        }
+        match media {
+            Some(np) => {
+                self.text(&fonts.semibold, &np.title, 12.5, text_x, mid - 2.0, max, WHITE, alpha);
+                self.text(&fonts.regular, &np.artist, 11.0, text_x, mid + 12.0, max, GRAY, alpha);
+            }
+            None => self.text(&fonts.semibold, "Not Playing", 12.5, text_x, mid + 4.5, max, DIM, alpha),
+        }
+    }
+
+    /// A ring that fills with the charge, the percentage inside; like the
+    /// iOS batteries widget.
+    fn battery_module(&mut self, battery: Option<Battery>, x: f32, y: f32, alpha: f32) {
+        let Some(module) = rounded_rect(x, y, MODULE_H, MODULE_H, MODULE_RADIUS) else { return };
+        self.glass(&module, alpha);
+        let (cx, cy, r) = (x + MODULE_H / 2.0, y + MODULE_H / 2.0, 18.0);
+        if let Some(track) = PathBuilder::from_circle(cx, cy, r) {
+            self.stroke(&track, 4.0, WHITE, alpha * 0.15);
+        }
+        let Some(fonts) = self.fonts else { return };
+        let Some(b) = battery else {
+            self.text_centered(&fonts.semibold, "—", 12.0, cx, cy + 4.0, DIM, alpha);
+            return;
+        };
+        // Green as on iOS, unless low and not charging.
+        let color = if !b.plugged && b.percent <= 20 { battery_color(b) } else { GREEN };
+        let sweep = 360.0 * b.percent as f32 / 100.0;
+        if let Some(level) = arc(cx, cy, r, -90.0, sweep) {
+            self.stroke(&level, 4.0, color, alpha);
+        }
+        let text = b.percent.to_string();
+        if b.plugged {
+            // Number nudged up to make room for the bolt below it.
+            self.text_centered(&fonts.semibold, &text, 12.0, cx, cy + 1.5, WHITE, alpha);
+            self.bolt(cx - 3.0, cy + 4.0, 0.5, color, alpha);
+        } else {
+            self.text_centered(&fonts.semibold, &text, 12.0, cx, cy + 4.0, WHITE, alpha);
+        }
+    }
+
+    /// The connected Bluetooth device's icon and name, or the radio's state.
+    fn bluetooth_module(&mut self, view: &ControlsView, x: f32, y: f32, w: f32, alpha: f32) {
+        let Some(module) = rounded_rect(x, y, w, MODULE_H, MODULE_RADIUS) else { return };
+        self.glass(&module, alpha);
+        let mid = y + MODULE_H / 2.0;
+        let device = view.bluetooth_device.filter(|_| view.state.bluetooth == Some(true));
+        let kind = device.map_or(DeviceKind::Other, |d| d.kind);
+        let icon_alpha = alpha * if device.is_some() { 1.0 } else { 0.45 };
+
+        // Too narrow for words: just the icon, centered.
+        let fonts = self.fonts.filter(|_| w >= 100.0);
+        let icon_x = if fonts.is_some() { x + 22.0 } else { x + w / 2.0 };
+        if device.is_some() {
+            // A blue disc behind the icon marks it connected.
+            if let Some(disc) = PathBuilder::from_circle(icon_x, mid, 14.0) {
+                self.fill(&disc, BLUE, alpha);
+            }
+        }
+        self.device_icon(kind, icon_x, mid, icon_alpha);
+        let Some(fonts) = fonts else { return };
+        let (title, detail) = match (device, view.state.bluetooth) {
+            (Some(d), _) => (d.name.as_str(), "Connected"),
+            (None, Some(true)) => ("Bluetooth", "Not connected"),
+            (None, Some(false)) => ("Bluetooth", "Off"),
+            (None, None) => ("Bluetooth", "Unavailable"),
+        };
+        let text_x = icon_x + 22.0;
+        let max = x + w - 12.0 - text_x;
+        self.text(&fonts.semibold, title, 12.5, text_x, mid - 2.0, max, WHITE, alpha);
+        self.text(&fonts.regular, detail, 11.0, text_x, mid + 12.0, max, GRAY, alpha);
     }
 
     /// A tall capsule that fills from the bottom, its symbol at the foot.
@@ -741,57 +965,6 @@ impl Canvas<'_> {
         }
         let paint = tiny_skia::PixmapPaint { opacity: alpha, ..Default::default() };
         self.pixmap.draw_pixmap(0, 0, layer.as_ref(), &paint, Transform::identity(), None);
-    }
-
-    /// Wi-Fi, Bluetooth and battery, one row each.
-    fn info_platter(&mut self, view: &ControlsView, x: f32, w: f32, alpha: f32) {
-        let Some(fonts) = self.fonts else { return };
-        if let Some(platter) = rounded_rect(x, CC_TOP, w, CC_HEIGHT, 24.0) {
-            self.fill(&platter, WHITE, alpha * 0.10);
-        }
-        let on_off = |v: Option<bool>| match v {
-            Some(true) => "On",
-            Some(false) => "Off",
-            None => "Unavailable",
-        };
-        let bluetooth = match (view.state.bluetooth, view.bluetooth_device) {
-            (Some(true), Some(device)) => device.to_owned(),
-            (state, _) => on_off(state).to_owned(),
-        };
-        let battery = view.battery.map(|b| {
-            let status = if b.plugged && b.charging {
-                " · Charging"
-            } else if b.plugged {
-                " · Plugged in"
-            } else {
-                ""
-            };
-            format!("{}%{status}", b.percent)
-        });
-
-        let rows: [(&str, String); 3] = [
-            ("Wi-Fi", on_off(view.state.wifi).to_owned()),
-            ("Bluetooth", bluetooth),
-            ("Battery", battery.unwrap_or_else(|| "—".to_owned())),
-        ];
-        let row_h = CC_HEIGHT / 3.0;
-        for (i, (label, detail)) in rows.iter().enumerate() {
-            let mid = CC_TOP + row_h * (i as f32 + 0.5);
-            let icon_x = x + 22.0;
-            match i {
-                0 => self.wifi_icon(icon_x, mid + 1.0, alpha),
-                1 => self.device_icon(DeviceKind::Other, icon_x, mid, alpha),
-                _ => {
-                    if let Some(b) = view.battery {
-                        self.battery_glyph(icon_x - 10.0, mid - 4.5, 9.0, Battery { plugged: false, ..b }, alpha);
-                    }
-                }
-            }
-            let text_x = x + 40.0;
-            let max = w - 40.0 - 12.0;
-            self.text(&fonts.semibold, label, 12.5, text_x, mid - 2.0, max, WHITE, alpha);
-            self.text(&fonts.regular, detail, 11.5, text_x, mid + 12.0, max, GRAY, alpha);
-        }
     }
 
     /// Two vertical dots on the right edge, the current page's bright.
@@ -937,7 +1110,47 @@ impl Canvas<'_> {
             Alert::Volume { level, muted } => self.volume_alert(*level, *muted, left, right, alpha),
             Alert::Toast(toast) => self.toast_alert(toast, left, right, alpha),
             Alert::Bluetooth { device, connected } => self.bluetooth_alert(device, *connected, left, right, alpha),
+            Alert::NowPlaying { track, since } => {
+                self.now_playing_alert(track, since.elapsed().as_secs_f32(), left, right, alpha)
+            }
         }
+    }
+
+    /// Cover on the left, title and artist beside it, and an equalizer
+    /// dancing in the cover's color on the right. `t` is seconds shown.
+    fn now_playing_alert(&mut self, np: &NowPlaying, t: f32, left: f32, right: f32, alpha: f32) {
+        // A little below center: the top edge meets the bezel.
+        let mid = NOW_PLAYING_ALERT.height / 2.0 + 2.0;
+        let art = 40.0;
+        let (art_x, art_y) = (left + 16.0, mid - art / 2.0);
+        match &np.art {
+            Some(a) => self.art(&a.pixmap, art_x, art_y, art, 10.0, alpha, 1.0),
+            None => {
+                if let Some(tile) = rounded_rect(art_x, art_y, art, art, 10.0) {
+                    self.fill(&tile, [60, 60, 66], alpha);
+                }
+            }
+        }
+
+        let (bar_w, gap, bars) = (3.5, 3.0, 4);
+        let eq_w = bars as f32 * bar_w + (bars - 1) as f32 * gap;
+        let eq_x = right - 22.0 - eq_w;
+        let color = np.art.as_ref().map_or(GREEN, |a| vivid(a.tint));
+        for i in 0..bars {
+            // Each bar bounces at its own rate; a paused track rests low.
+            let swing = if np.playing { 0.5 + 0.5 * (t * (5.0 + i as f32 * 1.7) + i as f32 * 1.3).sin() } else { 0.0 };
+            let h = 5.0 + 17.0 * swing;
+            let x = eq_x + i as f32 * (bar_w + gap);
+            if let Some(bar) = rounded_rect(x, mid - h / 2.0, bar_w, h, bar_w / 2.0) {
+                self.fill(&bar, color, alpha);
+            }
+        }
+
+        let Some(fonts) = self.fonts else { return };
+        let x = art_x + art + 12.0;
+        let max = eq_x - 14.0 - x;
+        self.text(&fonts.semibold, &np.title, 14.0, x, mid - 2.0, max, WHITE, alpha);
+        self.text(&fonts.regular, &np.artist, 12.5, x, mid + 14.0, max, GRAY, alpha);
     }
 
     /// Device icon and name on the left, "Connected"/"Disconnected" on the right.
@@ -1512,11 +1725,10 @@ impl Canvas<'_> {
                 Some(fonts) => fonts.glyph(font, ch, px),
                 None => Rc::new(font.rasterize(ch, px)),
             };
-            let (m, coverage) = &*glyph;
-            let gx = (pen + m.xmin as f32).round() as i32;
-            let gy = (baseline - m.height as f32 - m.ymin as f32) as i32;
-            self.blend_coverage(gx, gy, m.width, m.height, coverage, rgb, alpha);
-            pen += m.advance_width;
+            let gx = pen.round() as i32 + glyph.left;
+            let gy = baseline as i32 + glyph.top;
+            self.blend_coverage(gx, gy, glyph.width, glyph.height, &glyph.coverage, rgb, alpha);
+            pen += glyph.advance;
         }
     }
 
@@ -1635,6 +1847,7 @@ mod tests {
                 battery: Some(charging),
                 bluetooth: None,
                 alert: None,
+                alert_from: None,
                 page: 0.0,
                 controls: ControlsView::default(),
             },
@@ -1658,6 +1871,7 @@ mod tests {
                 battery: Some(on_battery),
                 bluetooth: None,
                 alert: None,
+                alert_from: None,
                 page: 0.0,
                 controls: ControlsView::default(),
             },
@@ -1665,13 +1879,19 @@ mod tests {
         );
 
         // Control Center: full width, player-only width, and mid-slide.
+        let buds = Device { name: "Galaxy Buds2 Pro".into(), kind: DeviceKind::Headphones };
+        let state = ControlState { wifi: Some(true), bluetooth: Some(true), brightness: Some(70) };
         let controls = ControlsView {
-            state: ControlState { wifi: Some(true), bluetooth: Some(true), brightness: Some(70) },
+            state,
             volume: 0.45,
             muted: false,
             brightness: None,
-            bluetooth_device: Some("Galaxy Buds2 Pro"),
+            bluetooth_device: Some(&buds),
             battery: Some(charging),
+            media: Some(&np),
+            toggle_on: Toggle::ALL.map(|t| if t.is_on(&state, false) { 1.0 } else { 0.0 }),
+            // Mute pressed in, to show the press.
+            toggle_scale: Toggle::ALL.map(|t| if t == Toggle::Mute { 0.88 } else { 1.0 }),
         };
         let page = |width: f32, page: f32| Scene {
             shape: Shape { width, ..EXPANDED },
@@ -1684,6 +1904,7 @@ mod tests {
             battery: Some(charging),
             bluetooth: None,
             alert: None,
+            alert_from: None,
             page,
             controls,
         };
@@ -1703,6 +1924,7 @@ mod tests {
             battery: Some(battery),
             bluetooth: Some(DeviceKind::Headphones),
             alert,
+            alert_from: None,
             page: 0.0,
             controls: ControlsView::default(),
         };
@@ -1712,7 +1934,16 @@ mod tests {
         let connected = Alert::Bluetooth { device: buds, connected: true };
         save_preview(&small(BLUETOOTH_ALERT, on_battery, Some(connected)), "preview_bluetooth.png");
         let plugged_in = Alert::Battery { event: BatteryEvent::PluggedIn, battery: charging };
-        save_preview(&small(BATTERY_ALERT, charging, Some(plugged_in)), "preview_alert.png");
+        save_preview(&small(BATTERY_ALERT, charging, Some(plugged_in.clone())), "preview_alert.png");
+        // "On battery" being replaced by "Charging": early, middle, late.
+        let unplugged = Alert::Battery { event: BatteryEvent::Unplugged, battery: on_battery };
+        for (p, name) in [(0.15, "a"), (0.4, "b"), (0.7, "c")] {
+            let scene = Scene {
+                alert_from: Some((unplugged.clone(), p)),
+                ..small(BATTERY_ALERT, charging, Some(plugged_in.clone()))
+            };
+            save_preview(&scene, &format!("preview_alert_swap_{name}.png"));
+        }
         let volume = Alert::Volume { level: 0.6, muted: false };
         save_preview(&small(VOLUME_ALERT, on_battery, Some(volume)), "preview_volume.png");
         let muted = Alert::Volume { level: 0.6, muted: true };
@@ -1731,6 +1962,11 @@ mod tests {
         };
         let toast = Alert::Toast(Arc::new(toast));
         save_preview(&small(TOAST_ALERT, on_battery, Some(toast)), "preview_toast.png");
+        // A new track, 0.4 s in, the equalizer mid-bounce.
+        let started = Instant::now() - Duration::from_millis(400);
+        let now_playing = Alert::NowPlaying { track: Box::new(np.clone()), since: started };
+        save_preview(&small(NOW_PLAYING_ALERT, on_battery, Some(now_playing)), "preview_now_playing.png");
+
         // A window under the notch: the mini pill, content faded out.
         save_preview(&small(MINI, on_battery, None), "preview_mini.png");
 
@@ -1751,7 +1987,7 @@ mod tests {
 }
 
 fn text_width(font: &Font, text: &str, px: f32) -> f32 {
-    text.chars().map(|c| font.metrics(c, px).advance_width).sum()
+    text.chars().map(|c| font.advance(c, px)).sum()
 }
 
 /// Breaks `text` into at most `max_lines` lines no wider than `max` (same
@@ -1785,11 +2021,11 @@ fn ellipsize(font: &Font, text: &str, px: f32, max: f32) -> String {
     if text_width(font, text, px) <= max {
         return text.to_owned();
     }
-    let budget = max - font.metrics('…', px).advance_width;
+    let budget = max - font.advance('…', px);
     let mut out = String::new();
     let mut width = 0.0;
     for c in text.chars() {
-        width += font.metrics(c, px).advance_width;
+        width += font.advance(c, px);
         if width > budget {
             break;
         }

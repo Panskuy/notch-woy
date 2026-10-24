@@ -15,6 +15,8 @@ pub struct Spring {
     pub value: f32,
     pub target: f32,
     velocity: f32,
+    stiffness: f32,
+    damping: f32,
 }
 
 const STIFFNESS: f32 = 320.0;
@@ -26,14 +28,21 @@ const EPSILON: f32 = 0.05;
 
 impl Spring {
     pub const fn new(value: f32) -> Self {
-        Self { value, target: value, velocity: 0.0 }
+        Self { value, target: value, velocity: 0.0, stiffness: STIFFNESS, damping: DAMPING }
+    }
+
+    /// Critically damped: glides to its target without overshooting, like
+    /// a page settling after a scroll.
+    pub const fn smooth(value: f32) -> Self {
+        // Damping ratio 1: damping = 2 * sqrt(stiffness).
+        Self { value, target: value, velocity: 0.0, stiffness: 196.0, damping: 28.0 }
     }
 
     pub fn update(&mut self, dt: f32) {
         let mut remaining = dt;
         while remaining > 0.0 {
             let h = remaining.min(STEP);
-            let force = STIFFNESS * (self.target - self.value) - DAMPING * self.velocity;
+            let force = self.stiffness * (self.target - self.value) - self.damping * self.velocity;
             self.velocity += force * h;
             self.value += self.velocity * h;
             remaining -= h;

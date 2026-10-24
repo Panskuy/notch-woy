@@ -12,15 +12,14 @@ use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
-use windows::Win32::UI::Shell::ABN_FULLSCREENAPP;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim::Spring;
-use crate::appbar::{self, WM_APPBAR};
 use crate::battery::{self, Battery};
 use crate::bluetooth::{Bluetooth, Device, WM_BLUETOOTH};
 use crate::controls::{ControlCommand, ControlState, Controls, WM_CONTROLS};
 use crate::volume::{Volume, WM_VOLUME};
+use crate::volume_keys::{self, VolumeKey, WM_VOLUME_KEY};
 use crate::lyrics::{Fetcher, LyricsState, Query, WM_LYRICS};
 use crate::media::{self, Command, Media, NowPlaying, WM_MEDIA};
 use crate::notifications::{Notifications, WM_TOAST};
@@ -44,6 +43,32 @@ const TRACK_TRANSITION: Duration = Duration::from_millis(600);
 const PROGRESS_TIMER: usize = 1;
 const PROGRESS_INTERVAL_MS: u32 = 100;
 
+/// Fires once a touchpad scroll has been still this long: the fingers
+/// lifted, so the pages settle.
+const SCROLL_END_TIMER: usize = 4;
+const SCROLL_END_MS: u32 = 120;
+/// Page travel (0..100) per unit of wheel delta: two mouse notches' worth
+/// of touchpad scrolling turns a page.
+const PAGE_PER_WHEEL_UNIT: f32 = 100.0 / 240.0;
+
+/// Past either page, travel is resisted and capped, like iOS rubber-banding.
+fn rubber_band(raw: f32) -> f32 {
+    const LIMIT: f32 = 18.0;
+    let stretch = |over: f32| LIMIT * (1.0 - 1.0 / (over * 0.55 / LIMIT + 1.0));
+    if raw < 0.0 {
+        -stretch(-raw)
+    } else if raw > 100.0 {
+        100.0 + stretch(raw - 100.0)
+    } else {
+        raw
+    }
+}
+
+/// A second look at what is under the notch, shortly after the active
+/// window changes.
+const RECHECK_TIMER: usize = 3;
+const RECHECK_MS: u32 = 250;
+
 /// Ends an alert after it has been shown this long.
 const ALERT_TIMER: usize = 2;
 const BATTERY_ALERT_MS: u32 = 3000;
@@ -51,11 +76,19 @@ const BATTERY_ALERT_MS: u32 = 3000;
 const VOLUME_ALERT_MS: u32 = 1500;
 const TOAST_ALERT_MS: u32 = 5000;
 const BLUETOOTH_ALERT_MS: u32 = 3000;
+const NOW_PLAYING_ALERT_MS: u32 = 4000;
+/// Tracks reported this soon after start-up are already playing, not new.
+const STARTUP_QUIET: Duration = Duration::from_secs(3);
 /// How long a notification lingers after the pointer leaves it.
 const TOAST_GRACE_MS: u32 = 2000;
 
 /// Velocities (logical px/s) of the width and height "bump" on a new track.
 const TRACK_PULSE: (f32, f32) = (320.0, 90.0);
+/// The same, when one alert replaces another; softer, as the shape is
+/// already out.
+const ALERT_PULSE: (f32, f32) = (260.0, 60.0);
+/// How long replaced alert content takes to slide out and the new in.
+const ALERT_TRANSITION: Duration = Duration::from_millis(450);
 
 // Lives in the large Win32_UI_Controls feature; not worth enabling for one constant.
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -94,6 +127,11 @@ struct App {
     /// The alert on screen; `leaving` once its time is up and the notch is
     /// shrinking back (its content fades with the shape).
     alert: Option<(Alert, bool)>,
+    /// The alert being replaced, and when the replacement started.
+    alert_transition: Option<(Alert, Instant)>,
+    /// When the app started; a track found playing right then gets no Now
+    /// Playing card.
+    started: Instant,
     /// Volume alert slider, in percent.
     volume: Spring,
     notifications: Notifications,
@@ -105,13 +143,25 @@ struct App {
     control_state: ControlState,
     /// Open notch page, 0 (player) .. 100 (Control Center).
     page: Spring,
-    /// Wheel travel not yet turned into a page change.
-    wheel: i32,
+    /// While a touchpad drags the pages: where the fingers have taken them
+    /// (0..100, unclamped), before rubber-banding.
+    page_drag: Option<f32>,
+    /// The drag's latest direction.
+    page_drag_toward_controls: bool,
     /// A Control Center slider being dragged, with its value (0..1).
     slider_drag: Option<(Slider, f32)>,
+    /// Per toggle (`Toggle::index`), how switched on it looks, 0..100;
+    /// eases the color change.
+    toggle_on: [Spring; 4],
+    /// Per toggle, its size in percent; dips while pressed and springs back.
+    toggle_press: [Spring; 4],
     /// The active window reaches under the notch (a maximized window's
     /// title bar or tabs), so it shrinks to a mini pill.
     obstructed: bool,
+    /// An app fills the whole monitor, so the notch is hidden.
+    fullscreen: bool,
+    /// The primary monitor's bounds, in physical pixels.
+    monitor: RECT,
 }
 
 thread_local! {
@@ -181,6 +231,8 @@ pub fn run() -> Result<()> {
             seeking: None,
             battery,
             alert: None,
+            alert_transition: None,
+            started: Instant::now(),
             volume: Spring::new(0.0),
             notifications: Notifications::spawn(hwnd),
             bluetooth: Bluetooth::spawn(hwnd),
@@ -188,18 +240,24 @@ pub fn run() -> Result<()> {
             audio: Volume::spawn(hwnd),
             controls: Controls::spawn(hwnd),
             control_state: ControlState::default(),
-            page: Spring::new(0.0),
-            wheel: 0,
+            page: Spring::smooth(0.0),
+            page_drag: None,
+            page_drag_toward_controls: false,
             slider_drag: None,
+            toggle_on: [Spring::smooth(0.0); 4],
+            toggle_press: [Spring::new(100.0); 4],
             obstructed: false,
+            fullscreen: false,
+            monitor: RECT::default(),
         };
         APP.with_borrow_mut(|slot| *slot = Some(app));
-        appbar::register(hwnd);
         tray::add(hwnd);
+        volume_keys::install(hwnd);
         with_app(App::relayout).transpose()?;
-        watch_windows();
-        with_app(App::update_obstruction);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        watch_windows();
+        // After showing: it hides the notch again if an app is full screen.
+        with_app(App::update_obstruction);
 
         let mut msg = MSG::default();
         loop {
@@ -229,14 +287,20 @@ pub fn run() -> Result<()> {
 }
 
 /// Re-checks what is under the notch whenever the active window changes,
-/// moves, resizes, or is minimized or restored. Out-of-context hooks are
-/// delivered through this thread's message loop, so no polling.
+/// appears, moves, resizes, or is minimized or restored. Out-of-context
+/// hooks are delivered through this thread's message loop, so no polling.
 fn watch_windows() {
     unsafe {
         for (first, last) in [
             (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
+            (EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND),
             (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
+            // A newly opened app often becomes active before it is shown,
+            // or while still cloaked for its opening animation (Store and
+            // Chromium apps), and then appears without moving.
+            (EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW),
             (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
+            (EVENT_OBJECT_UNCLOAKED, EVENT_OBJECT_UNCLOAKED),
         ] {
             SetWinEventHook(first, last, None, Some(on_window_event), 0, 0, WINEVENT_OUTOFCONTEXT);
         }
@@ -252,30 +316,38 @@ unsafe extern "system" fn on_window_event(
     _thread: u32,
     _time: u32,
 ) {
-    // Location changes fire for every caret and widget on screen; only the
-    // active window's own frame matters.
-    if event == EVENT_OBJECT_LOCATIONCHANGE
-        && (object != OBJID_WINDOW.0 || hwnd != unsafe { GetForegroundWindow() })
-    {
+    // Object events fire for every caret and widget on screen; only the
+    // active window itself matters.
+    let object_event = matches!(event, EVENT_OBJECT_SHOW | EVENT_OBJECT_LOCATIONCHANGE | EVENT_OBJECT_UNCLOAKED);
+    if object_event && (object != OBJID_WINDOW.0 || hwnd != unsafe { GetForegroundWindow() }) {
         return;
     }
-    with_app(App::update_obstruction);
+    with_app(|app| {
+        app.update_obstruction();
+        if event == EVENT_SYSTEM_FOREGROUND {
+            // Some apps size themselves just after activating; look again.
+            unsafe {
+                SetTimer(Some(app.hwnd), RECHECK_TIMER, RECHECK_MS, None);
+            }
+        }
+    });
 }
 
-/// Whether `hwnd` is an ordinary window whose frame overlaps `area`.
-fn covers(hwnd: HWND, area: RECT) -> bool {
+/// The visible frame of an ordinary app window: `None` for hidden or
+/// minimized windows, and for the desktop and taskbar, which fill the
+/// screen without being apps.
+fn app_frame(hwnd: HWND) -> Option<RECT> {
     unsafe {
         if hwnd.is_invalid() || !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
-            return false;
+            return None;
         }
-        // The desktop and taskbar are always "under" the notch.
         let mut class = [0u16; 32];
         let len = GetClassNameW(hwnd, &mut class) as usize;
         let class = String::from_utf16_lossy(&class[..len]);
         if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
-            return false;
+            return None;
         }
-        // The visible frame, without the invisible resize borders.
+        // Without the invisible resize borders.
         let mut frame = RECT::default();
         let got = DwmGetWindowAttribute(
             hwnd,
@@ -284,15 +356,43 @@ fn covers(hwnd: HWND, area: RECT) -> bool {
             size_of::<RECT>() as u32,
         );
         if got.is_err() && GetWindowRect(hwnd, &mut frame).is_err() {
-            return false;
+            return None;
         }
-        frame.left < area.right && frame.right > area.left && frame.top < area.bottom && frame.bottom > area.top
+        Some(frame)
     }
+}
+
+/// Whether `hwnd` is an app window whose frame overlaps `area`.
+fn covers(hwnd: HWND, area: RECT) -> bool {
+    app_frame(hwnd).is_some_and(|f| f.left < area.right && f.right > area.left && f.top < area.bottom && f.bottom > area.top)
+}
+
+/// Whether `hwnd` is an app filling the whole monitor, taskbar included:
+/// a game, full-screen video, a slideshow. Maximized windows stop at the
+/// taskbar, so they do not count.
+fn fills(hwnd: HWND, monitor: RECT) -> bool {
+    app_frame(hwnd).is_some_and(|f| {
+        f.left <= monitor.left && f.top <= monitor.top && f.right >= monitor.right && f.bottom >= monitor.bottom
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rubber_bands_past_the_pages() {
+        // Between the pages, travel is untouched.
+        assert_eq!(rubber_band(0.0), 0.0);
+        assert_eq!(rubber_band(37.5), 37.5);
+        assert_eq!(rubber_band(100.0), 100.0);
+        // Past them it is resisted, and never goes beyond the limit.
+        let a = rubber_band(-10.0);
+        let b = rubber_band(-40.0);
+        assert!(a < 0.0 && b < a && b > -18.0, "{a} {b}");
+        assert!(rubber_band(10_000.0) < 118.0);
+        assert!(rubber_band(110.0) > 100.0 && rubber_band(110.0) < 110.0);
+    }
 
     /// Prints whether the active window reaches under a 230x30 notch at the
     /// top center of the primary monitor:
@@ -312,11 +412,17 @@ mod tests {
             let mut class = [0u16; 64];
             let len = GetClassNameW(fg, &mut class) as usize;
             println!(
-                "active window class {:?}, maximized {}, under notch {}",
+                "active window class {:?}, maximized {}, under notch {}, full screen {}",
                 String::from_utf16_lossy(&class[..len]),
                 IsZoomed(fg).as_bool(),
-                covers(fg, area)
+                covers(fg, area),
+                fills(fg, m)
             );
+            // The desktop spans the monitor but must never count as a
+            // full-screen app (the shell's own notice gets this wrong).
+            let desktop = GetShellWindow();
+            println!("desktop full screen {}", fills(desktop, m));
+            assert!(!fills(desktop, m));
         }
     }
 }
@@ -341,6 +447,9 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 impl App {
     fn is_animating(&self) -> bool {
         self.transition.is_some()
+            || self.alert_transition.is_some()
+            // Its equalizer moves for as long as it is on screen.
+            || matches!(self.alert, Some((Alert::NowPlaying { .. }, _)))
             || ![
                 self.width,
                 self.height,
@@ -352,7 +461,41 @@ impl App {
                 self.page,
             ]
             .iter()
+            .chain(&self.toggle_on)
+            .chain(&self.toggle_press)
             .all(Spring::is_settled)
+    }
+
+    /// Points each toggle's color animation at its current state.
+    fn sync_toggles(&mut self) {
+        let (_, muted) = self.audio.level();
+        for toggle in Toggle::ALL {
+            let target = if toggle.is_on(&self.control_state, muted) { 100.0 } else { 0.0 };
+            let spring = &mut self.toggle_on[toggle.index()];
+            if spring.target != target {
+                spring.target = target;
+                self.start_animation();
+            }
+        }
+    }
+
+    /// Jumps the toggles to their state with no animation, for when the
+    /// page comes into view.
+    fn snap_toggles(&mut self) {
+        self.sync_toggles();
+        for spring in &mut self.toggle_on {
+            *spring = Spring::smooth(spring.target);
+        }
+    }
+
+    /// Lets go of any pressed toggle; it springs back to full size.
+    fn release_toggles(&mut self) {
+        for spring in &mut self.toggle_press {
+            if spring.target != 100.0 {
+                spring.target = 100.0;
+            }
+        }
+        self.start_animation();
     }
 
     /// Call before retargeting a spring, so the first frame's step is not
@@ -374,8 +517,8 @@ impl App {
         self.retarget();
         if !hovered {
             // It opens on the player next time, as the island does.
-            self.page = Spring::new(0.0);
-            self.wheel = 0;
+            self.page = Spring::smooth(0.0);
+            self.page_drag = None;
         }
 
         // A notification stays while the pointer rests on it, then gets a
@@ -391,6 +534,8 @@ impl App {
         }
 
         if hovered {
+            // Toggles open already showing their state, not fading into it.
+            self.snap_toggles();
             // Lyrics are not tracked while closed; jump to the current line
             // instead of scrolling through everything sung meanwhile.
             self.update_lyric_line(true);
@@ -418,10 +563,22 @@ impl App {
             bottom: self.origin.y + (rest.height * self.scale).round() as i32,
         };
         let foreground = unsafe { GetForegroundWindow() };
-        let obstructed = foreground != self.hwnd && covers(foreground, area);
+        let ours = foreground == self.hwnd;
+        let obstructed = !ours && covers(foreground, area);
         if obstructed != self.obstructed {
             self.obstructed = obstructed;
             self.retarget();
+        }
+
+        // Out of the way of games and full-screen video. Checked here rather
+        // than trusting the shell's full-screen notice, which also fires for
+        // the desktop and would hide the notch until some app opened.
+        let fullscreen = !ours && fills(foreground, self.monitor);
+        if fullscreen != self.fullscreen {
+            self.fullscreen = fullscreen;
+            unsafe {
+                let _ = ShowWindow(self.hwnd, if fullscreen { SW_HIDE } else { SW_SHOWNOACTIVATE });
+            }
         }
     }
 
@@ -498,6 +655,17 @@ impl App {
     /// Shows `alert` (replacing any other) until `shown_ms` pass without a
     /// new one.
     fn show_alert(&mut self, alert: Alert, shown_ms: u32) {
+        // Replacing an alert on screen (on battery → charging...) slides the
+        // old content out and the new in, with a small bump of the island.
+        // Volume updates repeat while a key is held and just update in place.
+        if let Some((old, false)) = self.alert.take() {
+            if !matches!((&old, &alert), (Alert::Volume { .. }, Alert::Volume { .. })) {
+                self.start_animation();
+                self.alert_transition = Some((old, Instant::now()));
+                self.width.kick(ALERT_PULSE.0);
+                self.height.kick(ALERT_PULSE.1);
+            }
+        }
         self.alert = Some((alert, false));
         // Re-setting a running timer restarts its countdown.
         unsafe {
@@ -506,8 +674,26 @@ impl App {
         self.retarget();
     }
 
+    /// A volume key, taken over from Windows. The device's change report
+    /// that follows brings up the notch's volume alert.
+    fn on_volume_key(&mut self, key: VolumeKey) {
+        let (level, muted) = self.audio.level();
+        match key {
+            VolumeKey::Mute => self.audio.set_mute(!muted),
+            VolumeKey::Up | VolumeKey::Down => {
+                // As in Windows, changing the volume unmutes.
+                if muted {
+                    self.audio.set_mute(false);
+                }
+                self.audio.set_level(volume_keys::step(level, key));
+            }
+        }
+    }
+
     /// A volume or mute change from any source.
     fn on_volume(&mut self, percent: u32, muted: bool) -> Result<()> {
+        // Mute may have changed (keyboard, another app): the Mute toggle.
+        self.sync_toggles();
         // The Control Center page already shows it, in its own slider.
         if self.on_controls_page() {
             return self.invalidate();
@@ -549,9 +735,15 @@ impl App {
         self.panel_width.update(dt);
         self.volume.update(dt);
         self.page.update(dt);
+        for spring in self.toggle_on.iter_mut().chain(&mut self.toggle_press) {
+            spring.update(dt);
+        }
         let result = self.redraw();
         if self.transition.as_ref().is_some_and(|(_, start)| start.elapsed() >= TRACK_TRANSITION) {
             self.transition = None;
+        }
+        if self.alert_transition.as_ref().is_some_and(|(_, start)| start.elapsed() >= ALERT_TRANSITION) {
+            self.alert_transition = None;
         }
         // A finished alert is dropped once the notch has shrunk back.
         if self.alert.as_ref().is_some_and(|(_, leaving)| *leaving) && self.height.is_settled() {
@@ -592,8 +784,11 @@ impl App {
             volume,
             muted,
             brightness,
-            bluetooth_device: self.bluetooth_device.as_ref().map(|d| d.name.as_str()),
+            bluetooth_device: self.bluetooth_device.as_ref(),
             battery: self.battery,
+            media: self.now_playing.as_ref(),
+            toggle_on: self.toggle_on.map(|s| s.value / 100.0),
+            toggle_scale: self.toggle_press.map(|s| s.value / 100.0),
         };
         let scene = Scene {
             shape,
@@ -609,6 +804,9 @@ impl App {
                 Alert::Volume { muted, .. } => Alert::Volume { level: self.volume.value / 100.0, muted: *muted },
                 other => other.clone(),
             }),
+            alert_from: self.alert_transition.as_ref().map(|(from, start)| {
+                (from.clone(), (start.elapsed().as_secs_f32() / ALERT_TRANSITION.as_secs_f32()).min(1.0))
+            }),
             page: self.page.value / 100.0,
             controls,
         };
@@ -622,35 +820,58 @@ impl App {
     }
 
     /// Mouse wheel or touchpad scroll: down for Control Center, up for the
-    /// player. Small touchpad steps add up until they make a full notch.
+    /// player. A mouse notch turns a whole page. A touchpad drags the pages
+    /// along with the fingers (rubber-banding past either end) and lets go
+    /// onto a page once the fingers stop.
     fn on_wheel(&mut self, delta: i32) -> Result<()> {
-        const STEP: i32 = 40;
         let open = self.hovered && self.height.value >= EXPANDED.height * 0.9 && !self.showing_toast();
-        if !open {
+        if !open || delta == 0 {
             return Ok(());
         }
-        self.wheel += delta;
-        let target = if self.wheel <= -STEP {
-            100.0
-        } else if self.wheel >= STEP {
-            0.0
-        } else {
+        self.start_animation();
+        // Mouse wheels move in whole notches of 120; touchpads in small steps.
+        if delta.abs() >= 120 && self.page_drag.is_none() {
+            self.settle_page(if delta < 0 { 100.0 } else { 0.0 });
             return Ok(());
-        };
-        self.wheel = 0;
-        if target != self.page.target {
-            self.start_animation();
-            self.page.target = target;
-            if target > 50.0 {
-                // Radios may have been switched elsewhere since last looked.
-                self.controls.send(ControlCommand::Refresh);
-            }
+        }
+        let raw = self.page_drag.unwrap_or(self.page.target) - delta as f32 * PAGE_PER_WHEEL_UNIT;
+        self.page_drag = Some(raw);
+        self.page_drag_toward_controls = delta < 0;
+        self.page.target = rubber_band(raw);
+        unsafe {
+            SetTimer(Some(self.hwnd), SCROLL_END_TIMER, SCROLL_END_MS, None);
         }
         Ok(())
     }
 
+    /// The fingers stopped: go to the page they were heading for once past
+    /// a fifth of the way, else back.
+    fn on_scroll_end(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), SCROLL_END_TIMER);
+        }
+        let Some(raw) = self.page_drag.take() else { return };
+        let target = match self.page_drag_toward_controls {
+            true if raw > 20.0 => 100.0,
+            false if raw < 80.0 => 0.0,
+            _ if raw > 50.0 => 100.0,
+            _ => 0.0,
+        };
+        self.start_animation();
+        self.settle_page(target);
+    }
+
+    fn settle_page(&mut self, target: f32) {
+        self.page.target = target;
+        if target > 50.0 {
+            // Radios may have been switched elsewhere since last looked.
+            self.controls.send(ControlCommand::Refresh);
+        }
+    }
+
     fn on_controls(&mut self) -> Result<()> {
         self.control_state = self.controls.state();
+        self.sync_toggles();
         self.invalidate()
     }
 
@@ -682,6 +903,14 @@ impl App {
                 self.audio.set_mute(!muted);
             }
         }
+        self.sync_toggles();
+    }
+
+    fn toggle_play_pause(&mut self) {
+        let Some(np) = self.now_playing.as_mut() else { return };
+        self.media.send(Command::TogglePlayPause);
+        // Flip the icon right away; the next poll confirms the real state.
+        np.playing = !np.playing;
     }
 
     fn apply_slider(&mut self, slider: Slider, value: f32) {
@@ -772,8 +1001,30 @@ impl App {
             self.lyric_line = None;
             self.lyric_scroll = Spring::new(-1.0);
         }
+        self.announce_track(track, next.as_ref());
         self.now_playing = next;
         self.invalidate()
+    }
+
+    /// Shows the Now Playing card for a new track, or refreshes the one up
+    /// (the cover often arrives a moment after the title).
+    fn announce_track(&mut self, track_changed: bool, next: Option<&NowPlaying>) {
+        let Some(np) = next else { return };
+        if !track_changed {
+            if let Some((Alert::NowPlaying { track, .. }, false)) = self.alert.as_mut() {
+                **track = np.clone();
+            }
+            return;
+        }
+        // Not for what was already playing when the app started (the media
+        // watcher reports it within its first poll), in the mini pill, over
+        // the open player, or over an app's notification.
+        let starting = self.started.elapsed() < STARTUP_QUIET;
+        if starting || self.obstructed || self.hovered || self.showing_toast() {
+            return;
+        }
+        let alert = Alert::NowPlaying { track: Box::new(np.clone()), since: Instant::now() };
+        self.show_alert(alert, NOW_PLAYING_ALERT_MS);
     }
 
     /// Where along the progress bar `pos` falls; see `render::progress_at`.
@@ -802,11 +1053,19 @@ impl App {
     /// press is on one.
     fn on_mouse_down(&mut self, x: f32, y: f32) -> Result<()> {
         if self.on_controls_page() {
-            if let Some(ControlHit::Slider(slider, value)) = self.control_at(x, y) {
-                self.apply_slider(slider, value);
-                // Keep receiving moves and the release even off the notch.
-                unsafe { SetCapture(self.hwnd) };
-                return self.invalidate();
+            match self.control_at(x, y) {
+                Some(ControlHit::Slider(slider, value)) => {
+                    self.apply_slider(slider, value);
+                    // Keep receiving moves and the release even off the notch.
+                    unsafe { SetCapture(self.hwnd) };
+                    return self.invalidate();
+                }
+                // Pressed in, like a button under a finger.
+                Some(ControlHit::Toggle(toggle)) => {
+                    self.start_animation();
+                    self.toggle_press[toggle.index()].target = 88.0;
+                }
+                _ => {}
             }
             return Ok(());
         }
@@ -886,11 +1145,13 @@ impl App {
             return Ok(());
         }
         if self.on_controls_page() {
-            if let Some(ControlHit::Toggle(toggle)) = self.control_at(x, y) {
-                self.toggle(toggle);
-                return self.invalidate();
+            self.release_toggles();
+            match self.control_at(x, y) {
+                Some(ControlHit::Toggle(toggle)) => self.toggle(toggle),
+                Some(ControlHit::PlayPause) => self.toggle_play_pause(),
+                _ => {}
             }
-            return Ok(());
+            return self.invalidate();
         }
         if !self.controls_ready() {
             return Ok(());
@@ -944,6 +1205,7 @@ impl App {
             }
 
             let mon = info.rcMonitor;
+            self.monitor = mon;
             self.origin = POINT {
                 x: mon.left + (mon.right - mon.left - w as i32) / 2,
                 y: mon.top,
@@ -1050,6 +1312,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             LRESULT(0)
         }
+        WM_VOLUME_KEY => {
+            if let Some(key) = VolumeKey::from_wparam(wparam) {
+                with_app(|app| app.on_volume_key(key));
+            }
+            LRESULT(0)
+        }
         WM_VOLUME => {
             let (percent, muted) = (wparam.0 as u32, lparam.0 != 0);
             if let Some(Err(e)) = with_app(|app| app.on_volume(percent, muted)) {
@@ -1067,6 +1335,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             if let Some(Err(e)) = with_app(App::on_toast) {
                 eprintln!("notification redraw failed: {e}");
             }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == SCROLL_END_TIMER => {
+            with_app(App::on_scroll_end);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == RECHECK_TIMER => {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), RECHECK_TIMER);
+            }
+            with_app(App::update_obstruction);
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == ALERT_TIMER => {
@@ -1098,18 +1377,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             tray::on_click(hwnd, lparam);
             LRESULT(0)
         }
-        WM_APPBAR => {
-            // Get out of the way of games and fullscreen video.
-            if wparam.0 as u32 == ABN_FULLSCREENAPP {
-                let cmd = if lparam.0 != 0 { SW_HIDE } else { SW_SHOWNOACTIVATE };
-                unsafe {
-                    let _ = ShowWindow(hwnd, cmd);
-                }
-            }
-            LRESULT(0)
-        }
         WM_DESTROY => {
-            appbar::unregister(hwnd);
+            // Hand the volume keys back to Windows.
+            volume_keys::uninstall();
             tray::remove(hwnd);
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
