@@ -61,6 +61,9 @@ Requires Windows 10 or 11, 64-bit.
 | Click or drag the progress bar | Seek |
 | Click 💬 | Show or hide lyrics |
 | Click a notification | Open the app that sent it |
+| Tray icon → Alerts | Turn each kind of alert on or off |
+| Tray icon → Alert duration / Notch width | Show alerts shorter or longer; widen the resting notch |
+| Tray icon → Bluetooth reconnects | How long a device that keeps reconnecting stays quiet |
 | Tray icon → Start at login / Exit | Autostart, quit |
 
 ## Good to know
@@ -73,7 +76,8 @@ Requires Windows 10 or 11, 64-bit.
   playing track are sent to lrclib.net. Notification contents are read and
   shown locally and never leave your machine.
 - **Volume keys** are handled by notch-woy while it runs, so Windows' own
-  volume pop-up stays hidden; they go back to Windows when it exits. Laptop
+  volume pop-up stays hidden; they go back to Windows when it exits, or
+  when the volume alert is turned off in the tray menu. Laptop
   Fn keys driven by the maker's own software, and headset buttons, may still
   show their own pop-ups.
 - **Airplane mode** turns Wi-Fi and Bluetooth off; Windows' own airplane mode
@@ -84,8 +88,9 @@ Requires Windows 10 or 11, 64-bit.
   2 s, so they can appear slightly after Windows shows them.
 - **Bluetooth alerts** skip devices that drop for a few seconds and come
   back (sleeping keyboards and mice). A device that keeps reconnecting
-  alerts once, then stays quiet until it has settled for 5 minutes; the
-  indicator still follows it.
+  alerts once, then stays quiet until it has settled for 5 minutes (change
+  it under *Bluetooth reconnects* in the tray menu); the indicator still
+  follows it.
 
 ## Building from source
 

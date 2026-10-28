@@ -25,6 +25,7 @@ use crate::lyrics::{Fetcher, LyricsState, Query, WM_LYRICS};
 use crate::media::{self, Command, Media, NowPlaying, WM_MEDIA};
 use crate::notifications::{Notifications, WM_TOAST};
 use crate::outputs::{Output, Outputs, WM_OUTPUTS};
+use crate::settings::{AlertKind, Settings};
 use crate::tray::{self, WM_TRAY};
 use crate::render::{
     self, Alert, Button, ControlHit, ControlsView, Fonts, LyricsView, OutputsView, Scene, Shape, Slider, Toggle,
@@ -212,6 +213,8 @@ struct App {
     shadow: Option<(Pixmap, Surface)>,
     /// Width, height and radius the shadow was last drawn for.
     shadow_shape: Option<(f32, f32, f32)>,
+    /// The tray menu's choices.
+    settings: Settings,
 }
 
 thread_local! {
@@ -284,6 +287,7 @@ pub fn run() -> Result<()> {
 
         let battery = battery::read();
         battery::subscribe(hwnd);
+        let settings = Settings::load();
 
         let app = App {
             hwnd,
@@ -292,7 +296,7 @@ pub fn run() -> Result<()> {
             scale: 1.0,
             origin: POINT::default(),
             hovered: false,
-            width: Spring::new(collapsed_shape(battery).width),
+            width: Spring::new(collapsed_shape(battery, settings).width),
             height: Spring::new(COLLAPSED.height),
             radius: Spring::new(COLLAPSED.radius),
             last_tick: Instant::now(),
@@ -315,7 +319,7 @@ pub fn run() -> Result<()> {
             started: Instant::now(),
             volume: Spring::new(0.0),
             notifications: Notifications::spawn(hwnd),
-            bluetooth: Bluetooth::spawn(hwnd),
+            bluetooth: Bluetooth::spawn(hwnd, settings.bluetooth_quiet()),
             bluetooth_device: None,
             audio: Volume::spawn(hwnd),
             controls: Controls::spawn(hwnd),
@@ -342,13 +346,18 @@ pub fn run() -> Result<()> {
             shadow_hwnd,
             shadow: None,
             shadow_shape: None,
+            settings,
         };
         // Read ahead so the picker opens with the list already there.
         app.outputs.refresh();
         APP.with_borrow_mut(|slot| *slot = Some(app));
         NOTCH_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
         tray::add(hwnd);
-        volume_keys::install(hwnd);
+        // Only while the notch shows volume alerts: otherwise the keys would
+        // change the volume with nothing on screen.
+        if settings.alert_enabled(AlertKind::Volume) {
+            volume_keys::install(hwnd);
+        }
         with_app(App::relayout).transpose()?;
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         watch_windows();
@@ -560,12 +569,11 @@ mod tests {
     }
 }
 
-/// The resting notch, a little wider when it has a battery to show.
-fn collapsed_shape(battery: Option<Battery>) -> Shape {
-    match battery {
-        Some(_) => Shape { width: COLLAPSED_BATTERY_WIDTH, ..COLLAPSED },
-        None => COLLAPSED,
-    }
+/// The resting notch, a little wider when it has a battery to show, plus
+/// the width setting's extra.
+fn collapsed_shape(battery: Option<Battery>, settings: Settings) -> Shape {
+    let width = if battery.is_some() { COLLAPSED_BATTERY_WIDTH } else { COLLAPSED.width };
+    Shape { width: width + settings.width.extra(), ..COLLAPSED }
 }
 
 /// Runs `f` on the app state. Returns `None` before the app exists or when
@@ -699,7 +707,7 @@ impl App {
     /// Shrinks the notch to its mini pill while the active window reaches
     /// under its full resting size, and back when it does not.
     fn update_obstruction(&mut self) {
-        let rest = collapsed_shape(self.battery);
+        let rest = collapsed_shape(self.battery, self.settings);
         let half = (rest.width * self.scale / 2.0).round() as i32;
         let center = self.origin.x + self.pixmap.width() as i32 / 2;
         let area = RECT {
@@ -748,10 +756,48 @@ impl App {
         }
     }
 
+    /// Takes new tray menu choices into effect.
+    fn apply_settings(&mut self, next: Settings) -> Result<()> {
+        let before = std::mem::replace(&mut self.settings, next);
+        let volume_alerts = next.alert_enabled(AlertKind::Volume);
+        if volume_alerts != before.alert_enabled(AlertKind::Volume) {
+            // Without the notch's alert, the keys go back to Windows and its
+            // own pop-up.
+            if volume_alerts {
+                volume_keys::install(self.hwnd);
+            } else {
+                volume_keys::uninstall();
+            }
+        }
+        if next.bluetooth_quiet_minutes != before.bluetooth_quiet_minutes {
+            self.bluetooth.set_repeat_quiet(next.bluetooth_quiet());
+        }
+        // An alert of a kind just turned off leaves right away.
+        let kind = self.alert.as_ref().filter(|(_, leaving)| !leaving).map(|(alert, _)| match alert {
+            Alert::Battery { .. } => AlertKind::Battery,
+            Alert::Volume { .. } => AlertKind::Volume,
+            Alert::Toast(_) => AlertKind::Notifications,
+            Alert::Bluetooth { .. } => AlertKind::Bluetooth,
+            Alert::NowPlaying { .. } => AlertKind::NowPlaying,
+        });
+        if kind.is_some_and(|kind| !next.alert_enabled(kind)) {
+            self.end_alert();
+        }
+        if next.width != before.width {
+            // The area that counts as under the notch changes with it.
+            self.update_obstruction();
+        }
+        self.retarget();
+        self.invalidate()
+    }
+
     /// Refreshes the indicator and alerts the latest connect/disconnect.
     fn on_bluetooth(&mut self) -> Result<()> {
         self.bluetooth_device = self.bluetooth.primary();
-        if let Some((device, connected)) = self.bluetooth.take_latest_event() {
+        // Taken either way, so a change made while alerts are off does not
+        // show up once they are back on.
+        let event = self.bluetooth.take_latest_event();
+        if let Some((device, connected)) = event.filter(|_| self.settings.alert_enabled(AlertKind::Bluetooth)) {
             self.show_alert(Alert::Bluetooth { device, connected }, BLUETOOTH_ALERT_MS);
         }
         self.invalidate()
@@ -759,6 +805,9 @@ impl App {
 
     fn on_toast(&mut self) -> Result<()> {
         let Some(toast) = self.notifications.take_latest() else { return Ok(()) };
+        if !self.settings.alert_enabled(AlertKind::Notifications) {
+            return Ok(());
+        }
         self.show_alert(Alert::Toast(toast), TOAST_ALERT_MS);
         if self.hovered {
             // Already under the pointer: hold it like a hovered one.
@@ -780,16 +829,17 @@ impl App {
     fn retarget(&mut self) {
         self.start_animation();
         let showing_alert = self.alert.as_ref().filter(|(_, leaving)| !leaving).map(|(alert, _)| alert);
+        let rest = collapsed_shape(self.battery, self.settings);
         let target = if let Some(alert) = showing_alert.filter(|_| self.showing_toast()) {
-            render::alert_shape(alert)
+            render::alert_shape(alert, rest.width)
         } else if self.hovered {
             Shape { width: self.panel_width.target, ..EXPANDED }
         } else if let Some(alert) = showing_alert {
-            render::alert_shape(alert)
+            render::alert_shape(alert, rest.width)
         } else if self.obstructed {
             MINI
         } else {
-            collapsed_shape(self.battery)
+            rest
         };
         self.width.target = target.width;
         self.height.target = target.height;
@@ -806,7 +856,8 @@ impl App {
         let event = self.battery.zip(now).and_then(|(before, after)| battery::event(before, after));
         let had_battery = self.battery.is_some();
         self.battery = now;
-        if let Some((event, battery)) = event.zip(now) {
+        let alerts = self.settings.alert_enabled(AlertKind::Battery);
+        if let Some((event, battery)) = event.zip(now).filter(|_| alerts) {
             self.show_alert(Alert::Battery { event, battery }, BATTERY_ALERT_MS);
         } else if let (Some((Alert::Battery { battery, .. }, _)), Some(b)) = (self.alert.as_mut(), now) {
             // Keep a battery alert's level live while it is up.
@@ -833,6 +884,7 @@ impl App {
             }
         }
         self.alert = Some((alert, false));
+        let shown_ms = self.settings.duration.scale(shown_ms);
         // Re-setting a running timer restarts its countdown.
         unsafe {
             SetTimer(Some(self.hwnd), ALERT_TIMER, shown_ms, None);
@@ -861,7 +913,7 @@ impl App {
         // Mute may have changed (keyboard, another app): the Mute toggle.
         self.sync_toggles();
         // The Control Center page already shows it, in its own slider.
-        if self.on_controls_page() {
+        if self.on_controls_page() || !self.settings.alert_enabled(AlertKind::Volume) {
             return self.invalidate();
         }
         let showing = matches!(self.alert, Some((Alert::Volume { .. }, false)));
@@ -972,6 +1024,7 @@ impl App {
             seek: self.seeking,
             seek_grow: self.seek_grow.value / 100.0,
             battery: self.battery,
+            rest_width: collapsed_shape(self.battery, self.settings).width,
             bluetooth: self.bluetooth_device.as_ref().map(|d| d.kind),
             alert: self.alert.as_ref().map(|(alert, _)| match alert {
                 Alert::Volume { muted, .. } => Alert::Volume { level: self.volume.value / 100.0, muted: *muted },
@@ -1352,7 +1405,7 @@ impl App {
         // watcher reports it within its first poll), in the mini pill, over
         // the open player, or over an app's notification.
         let starting = self.started.elapsed() < STARTUP_QUIET;
-        if starting || self.obstructed || self.hovered || self.showing_toast() {
+        if starting || !self.settings.alert_enabled(AlertKind::NowPlaying) || self.obstructed || self.hovered || self.showing_toast() {
             return;
         }
         let alert = Alert::NowPlaying { track: Box::new(np.clone()), since: Instant::now() };
@@ -1808,7 +1861,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_TRAY => {
-            tray::on_click(hwnd, lparam);
+            // The menu runs its own message loop; the app state must not be
+            // borrowed meanwhile, or every message in that loop is lost.
+            let Some(settings) = with_app(|app| app.settings) else { return LRESULT(0) };
+            if let Some(next) = tray::on_click(hwnd, lparam, settings) {
+                next.save();
+                if let Some(Err(e)) = with_app(|app| app.apply_settings(next)) {
+                    eprintln!("applying settings failed: {e}");
+                }
+            }
             LRESULT(0)
         }
         WM_DESTROY => {

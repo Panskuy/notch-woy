@@ -28,12 +28,25 @@ impl AlertKind {
     }
 }
 
-/// How long alerts stay up, relative to each kind's own length.
+impl AlertKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Battery => "Battery",
+            Self::Volume => "Volume (replaces the Windows pop-up)",
+            Self::Bluetooth => "Bluetooth devices",
+            Self::Notifications => "App notifications",
+            Self::NowPlaying => "New track",
+        }
+    }
+}
+
+/// How long alerts stay up, relative to each kind's own length. The
+/// discriminants are what is stored.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AlertDuration {
-    Short,
-    Normal,
-    Long,
+    Short = 0,
+    Normal = 1,
+    Long = 2,
 }
 
 impl AlertDuration {
@@ -47,27 +60,58 @@ impl AlertDuration {
             Self::Long => base_ms * 8 / 5,
         }
     }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Short => "Short",
+            Self::Normal => "Normal",
+            Self::Long => "Long",
+        }
+    }
 }
 
-/// Extra width of the resting notch, so its content has more room.
+/// How much narrower or wider than the default the resting notch is. The
+/// discriminants are what is stored: Narrow came later, so it is 3.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NotchWidth {
-    Normal,
-    Wide,
-    Wider,
+    Normal = 0,
+    Wide = 1,
+    Wider = 2,
+    Narrow = 3,
 }
 
 impl NotchWidth {
-    pub const ALL: [Self; 3] = [Self::Normal, Self::Wide, Self::Wider];
+    /// In the order they are offered.
+    pub const ALL: [Self; 4] = [Self::Narrow, Self::Normal, Self::Wide, Self::Wider];
 
-    /// Logical px added to the resting width. Never narrower than the
-    /// default: the resting content is laid out for at least that.
+    /// Logical px added to the default resting width.
     pub fn extra(self) -> f32 {
         match self {
+            Self::Narrow => -40.0,
             Self::Normal => 0.0,
             Self::Wide => 40.0,
             Self::Wider => 80.0,
         }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Narrow => "Narrow",
+            Self::Normal => "Normal",
+            Self::Wide => "Wide",
+            Self::Wider => "Wider",
+        }
+    }
+}
+
+/// Label for one of `BLUETOOTH_QUIET_MINUTES`.
+pub fn bluetooth_quiet_label(minutes: u32) -> &'static str {
+    match minutes {
+        0 => "Alert every time",
+        1 => "Quiet for 1 minute",
+        5 => "Quiet for 5 minutes",
+        15 => "Quiet for 15 minutes",
+        _ => "Quiet for 1 hour",
     }
 }
 
@@ -124,8 +168,10 @@ impl Settings {
         let all = default.alerts;
         Self {
             alerts: alerts.map_or(all, |bits| bits & all),
-            duration: duration.and_then(|i| AlertDuration::ALL.get(i as usize).copied()).unwrap_or(default.duration),
-            width: width.and_then(|i| NotchWidth::ALL.get(i as usize).copied()).unwrap_or(default.width),
+            duration: duration
+                .and_then(|v| AlertDuration::ALL.into_iter().find(|&d| d as u32 == v))
+                .unwrap_or(default.duration),
+            width: width.and_then(|v| NotchWidth::ALL.into_iter().find(|&w| w as u32 == v)).unwrap_or(default.width),
             bluetooth_quiet_minutes: quiet
                 .filter(|m| BLUETOOTH_QUIET_MINUTES.contains(m))
                 .unwrap_or(default.bluetooth_quiet_minutes),
@@ -200,6 +246,10 @@ mod tests {
         assert_eq!(Settings::from_values(None, None, None, None), Settings::default());
         let odd = Settings::from_values(Some(u32::MAX), Some(9), Some(7), Some(3));
         assert_eq!(odd, Settings::default());
+        // Stored numbers stay what they were before Narrow was added.
+        assert_eq!(Settings::from_values(None, None, Some(0), None).width, NotchWidth::Normal);
+        assert_eq!(Settings::from_values(None, None, Some(2), None).width, NotchWidth::Wider);
+        assert_eq!(Settings::from_values(None, None, Some(3), None).width, NotchWidth::Narrow);
         let set = Settings::from_values(Some(0), Some(2), Some(1), Some(0));
         assert!(AlertKind::ALL.iter().all(|&kind| !set.alert_enabled(kind)));
         assert_eq!(set.duration, AlertDuration::Long);

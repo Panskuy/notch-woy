@@ -34,12 +34,15 @@ Sebelum mulai satu item, cek dulu apakah API-nya jalan di aplikasi
 
 ### Prioritas tinggi
 
-- [ ] **Pengaturan** (semua referensi punya; notch-woy hanya punya menu tray).
-      Minimal: alert mana yang aktif (baterai, volume, Bluetooth, notifikasi,
-      lagu baru), durasi tampil, lebar notch, jeda Bluetooth
-      (`DISCONNECT_GRACE`/`REPEAT_QUIET`). Simpan di `HKCU\Software\notch-woy`
-      (sudah dipakai `autostart.rs`) atau file TOML di `%APPDATA%`.
-      Langkah awal termurah: centang per alert di menu tray (`tray.rs`).
+- [x] **Pengaturan** lewat menu tray (2026-10-30, `settings.rs`): alert per
+      jenis, durasi alert (Short/Normal/Long), lebar notch
+      (Normal/Wide/Wider), jeda Bluetooth (0/1/5/15/60 menit). Disimpan di
+      `HKCU\Software\notch-woy`. Mematikan alert volume mengembalikan tombol
+      volume ke Windows. Jeda putus Bluetooth (`DISCONNECT_GRACE`, 8 s)
+      sengaja tetap: itu penyaring, bukan selera.
+  - [ ] Lanjutan bila perlu: jendela pengaturan sendiri (bukan menu), dan
+        lebar lebih sempit dari default (isi notch istirahat harus ditata
+        ulang dulu).
 - [ ] **Mode jangan ganggu / jeda alert** dari menu tray, dan idealnya ikut
       status Do Not Disturb Windows. Alert tetap tercatat untuk indikator.
 - [ ] **Baterai perangkat Bluetooth** (DynamicWin): tampilkan persen baterai

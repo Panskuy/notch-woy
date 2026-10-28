@@ -17,6 +17,7 @@ mod notifications;
 mod outputs;
 mod palette;
 mod render;
+mod settings;
 mod tray;
 mod volume;
 mod volume_keys;

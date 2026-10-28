@@ -51,14 +51,17 @@ pub const MINI: Shape = Shape { width: 80.0, height: 10.0, radius: 5.0 };
 /// A Bluetooth device connecting or disconnecting.
 pub const BLUETOOTH_ALERT: Shape = Shape { width: 340.0, height: 40.0, radius: 18.0 };
 
-pub fn alert_shape(alert: &Alert) -> Shape {
-    match alert {
+/// The shape `alert` grows into from a resting notch `rest_width` wide; at
+/// least that wide, so a widened notch does not narrow for an alert.
+pub fn alert_shape(alert: &Alert, rest_width: f32) -> Shape {
+    let shape = match alert {
         Alert::Battery { .. } => BATTERY_ALERT,
         Alert::Volume { .. } => VOLUME_ALERT,
         Alert::Toast(_) => TOAST_ALERT,
         Alert::Bluetooth { .. } => BLUETOOTH_ALERT,
         Alert::NowPlaying { .. } => NOW_PLAYING_ALERT,
-    }
+    };
+    Shape { width: shape.width.max(rest_width), ..shape }
 }
 
 /// A new track: cover, title and artist, with a live equalizer.
@@ -208,6 +211,8 @@ pub struct Scene<'a> {
     pub seek_grow: f32,
     /// `None` on machines without a battery.
     pub battery: Option<Battery>,
+    /// The resting notch's width (it depends on the battery and settings).
+    pub rest_width: f32,
     /// The kind of Bluetooth device the resting notch shows, if any is
     /// connected.
     pub bluetooth: Option<DeviceKind>,
@@ -499,8 +504,8 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
     // fades again if it keeps growing into the open notch.
     let alert_alpha = match &scene.alert {
         Some(alert) => {
-            let target = alert_shape(alert);
-            let rest_width = if scene.battery.is_some() { COLLAPSED_BATTERY_WIDTH } else { COLLAPSED.width };
+            let rest_width = scene.rest_width;
+            let target = alert_shape(alert, rest_width);
             // How far along each dimension that changes; both must get there.
             let progress = |now: f32, from: f32, to: f32| {
                 if (to - from).abs() > 1.0 { (now - from) / (to - from) } else { 1.0 }
@@ -536,8 +541,7 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
     let (left, right) = ((canvas_w - shape.width) / 2.0, (canvas_w + shape.width) / 2.0);
 
     // The resting content fades out as the notch shrinks into its mini pill.
-    let rest_width = if scene.battery.is_some() { COLLAPSED_BATTERY_WIDTH } else { COLLAPSED.width };
-    let unshrunk = ((shape.width - MINI.width) / (rest_width - MINI.width)).clamp(0.0, 1.0);
+    let unshrunk = ((shape.width - MINI.width) / (scene.rest_width - MINI.width)).clamp(0.0, 1.0);
     let collapsed_alpha = (1.0 - t * 3.0).clamp(0.0, 1.0) * (1.0 - alert_alpha) * unshrunk * unshrunk;
     if collapsed_alpha > 0.0 {
         canvas.collapsed(media, transition, scene.battery, scene.bluetooth, scene.clock, left, right, collapsed_alpha);
@@ -2142,6 +2146,7 @@ mod tests {
     use super::*;
     use crate::media::{Artwork, Timeline};
     use crate::palette;
+    use crate::settings::NotchWidth;
 
     #[test]
     fn finds_the_tapped_lyric_line() {
@@ -2226,6 +2231,7 @@ mod tests {
                 seek: None,
                 seek_grow: 0.0,
                 battery: Some(charging),
+                rest_width: COLLAPSED_BATTERY_WIDTH,
                 bluetooth: None,
                 alert: None,
                 alert_from: None,
@@ -2253,6 +2259,7 @@ mod tests {
                 seek: Some(0.6),
                 seek_grow: 1.0,
                 battery: Some(on_battery),
+                rest_width: COLLAPSED_BATTERY_WIDTH,
                 bluetooth: None,
                 alert: None,
                 alert_from: None,
@@ -2289,6 +2296,7 @@ mod tests {
             seek: None,
             seek_grow: 0.0,
             battery: Some(charging),
+            rest_width: COLLAPSED_BATTERY_WIDTH,
             bluetooth: None,
             alert: None,
             alert_from: None,
@@ -2336,6 +2344,7 @@ mod tests {
             seek: None,
             seek_grow: 0.0,
             battery: Some(battery),
+            rest_width: COLLAPSED_BATTERY_WIDTH,
             bluetooth: Some(DeviceKind::Headphones),
             alert,
             alert_from: None,
@@ -2346,6 +2355,18 @@ mod tests {
         };
         let rest = Shape { width: COLLAPSED_BATTERY_WIDTH, ..COLLAPSED };
         save_preview(&small(rest, on_battery, None), "preview_collapsed.png");
+        // The widest setting: same content, more room around it.
+        let wider = Shape { width: COLLAPSED_BATTERY_WIDTH + NotchWidth::Wider.extra(), ..COLLAPSED };
+        let scene = Scene { rest_width: wider.width, ..small(wider, on_battery, None) };
+        save_preview(&scene, "preview_collapsed_wider.png");
+        // The narrowest, at its fullest: art, equalizer, Bluetooth, and a
+        // charging battery; then without a battery.
+        let narrow = Shape { width: COLLAPSED_BATTERY_WIDTH + NotchWidth::Narrow.extra(), ..COLLAPSED };
+        let scene = Scene { rest_width: narrow.width, ..small(narrow, charging, None) };
+        save_preview(&scene, "preview_collapsed_narrow.png");
+        let narrow = Shape { width: COLLAPSED.width + NotchWidth::Narrow.extra(), ..COLLAPSED };
+        let scene = Scene { rest_width: narrow.width, battery: None, ..small(narrow, charging, None) };
+        save_preview(&scene, "preview_collapsed_narrow_no_battery.png");
         let buds = Device { name: "Galaxy Buds2 Pro".into(), kind: DeviceKind::Headphones };
         let connected = Alert::Bluetooth { device: buds, connected: true };
         save_preview(&small(BLUETOOTH_ALERT, on_battery, Some(connected)), "preview_bluetooth.png");

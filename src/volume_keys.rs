@@ -37,8 +37,12 @@ static HOOK: AtomicIsize = AtomicIsize::new(0);
 /// Mute toggles once per press, not on every auto-repeat while held.
 static MUTE_HELD: AtomicBool = AtomicBool::new(false);
 
+/// Takes the keys over; does nothing if they already are.
 pub fn install(hwnd: HWND) {
     NOTCH.store(hwnd.0 as isize, Ordering::Relaxed);
+    if HOOK.load(Ordering::Relaxed) != 0 {
+        return;
+    }
     let module = unsafe { GetModuleHandleW(None) }.ok().map(Into::into);
     match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), module, 0) } {
         Ok(hook) => HOOK.store(hook.0 as isize, Ordering::Relaxed),

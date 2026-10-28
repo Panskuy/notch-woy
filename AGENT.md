@@ -43,7 +43,8 @@ target/, dist/    output build, di-.gitignore
 | `bluetooth.rs` | Poll perangkat Bluetooth (classic + LE) tiap 2 s, lapor connect/disconnect. |
 | `notifications.rs` | Poll toast di notification center (`UserNotificationListener`) tiap 0.7 s; klik membuka aplikasi pengirim. |
 | `controls.rs` | Control Center: radio Wi-Fi/Bluetooth, airplane mode, brightness (WMI untuk layar internal, DDC/CI untuk monitor eksternal) di worker thread. |
-| `tray.rs` | Ikon tray + menu (Start at login, Exit); ditambah ulang saat Explorer restart. |
+| `tray.rs` | Ikon tray + menu (submenu pengaturan, Start at login, Exit); ditambah ulang saat Explorer restart. `on_click` mengembalikan `Settings` baru, `window.rs` yang menyimpan dan menerapkannya. |
+| `settings.rs` | Pengaturan pengguna (alert per jenis, durasi alert, lebar notch, jeda Bluetooth) sebagai DWORD di `HKCU\Software\notch-woy`; nilai hilang/tidak valid kembali ke default. |
 | `autostart.rs` | Registry `HKCU\...\Run` dan `HKCU\Software\notch-woy\AutostartChosen`. |
 | `icon.rs` | Hanya `#[cfg(test)]`: menggambar dan menulis `assets/notch-woy.ico`. |
 | `memory.rs` | Hanya `#[cfg(test)]`: mengukur pemakaian memori per langkah. |

@@ -5,6 +5,7 @@
 //! "connected" does not reliably report a device that stops matching.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,9 +23,6 @@ pub const WM_BLUETOOTH: u32 = WM_APP + 6;
 const POLL: Duration = Duration::from_secs(2);
 /// A device must stay gone this long to count as disconnected.
 const DISCONNECT_GRACE: Duration = Duration::from_secs(8);
-/// After a device connects (or disconnects), the same change again within
-/// this time is not alerted; the indicator still follows it.
-const REPEAT_QUIET: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum DeviceKind {
@@ -50,21 +48,30 @@ struct State {
 
 pub struct Bluetooth {
     state: Arc<Mutex<State>>,
+    /// After a device connects (or disconnects), the same change again
+    /// within this many seconds is not alerted; the indicator still
+    /// follows it. Read by the watcher on every poll.
+    repeat_quiet_secs: Arc<AtomicU64>,
 }
 
 impl Bluetooth {
     /// Starts watching; posts `WM_BLUETOOTH` to `hwnd` on every change.
-    pub fn spawn(hwnd: HWND) -> Self {
+    pub fn spawn(hwnd: HWND, repeat_quiet: Duration) -> Self {
         let state = Arc::new(Mutex::new(State::default()));
-        let shared = state.clone();
+        let repeat_quiet_secs = Arc::new(AtomicU64::new(repeat_quiet.as_secs()));
+        let (shared, quiet) = (state.clone(), repeat_quiet_secs.clone());
         // HWND is not Send; pass the raw handle value across.
         let raw = hwnd.0 as isize;
         thread::spawn(move || {
-            if let Err(e) = run(raw, shared) {
+            if let Err(e) = run(raw, shared, quiet) {
                 eprintln!("bluetooth watcher stopped: {e}");
             }
         });
-        Self { state }
+        Self { state, repeat_quiet_secs }
+    }
+
+    pub fn set_repeat_quiet(&self, quiet: Duration) {
+        self.repeat_quiet_secs.store(quiet.as_secs(), Ordering::Relaxed);
     }
 
     /// The device the notch's indicator stands for: an audio device if one
@@ -85,7 +92,7 @@ impl Bluetooth {
     }
 }
 
-fn run(hwnd: isize, state: Arc<Mutex<State>>) -> Result<()> {
+fn run(hwnd: isize, state: Arc<Mutex<State>>, repeat_quiet_secs: Arc<AtomicU64>) -> Result<()> {
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
     let classic = BluetoothDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected)?;
     let le = BluetoothLEDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected)?;
@@ -109,7 +116,8 @@ fn run(hwnd: isize, state: Arc<Mutex<State>>) -> Result<()> {
         // A failed lookup says nothing about the devices; skip it rather
         // than read it as everything disconnecting.
         let Some(now) = connected(&classic, &le, &mut kinds) else { continue };
-        let (changed, events) = tracker.update(now, Instant::now());
+        let quiet = Duration::from_secs(repeat_quiet_secs.load(Ordering::Relaxed));
+        let (changed, events) = tracker.update(now, Instant::now(), quiet);
         if !changed {
             continue;
         }
@@ -134,8 +142,9 @@ struct Tracker {
 
 impl Tracker {
     /// Takes the devices connected `now`. Returns whether the connected
-    /// list changed, and the changes to alert.
-    fn update(&mut self, polled: Vec<Device>, now: Instant) -> (bool, Vec<(Device, bool)>) {
+    /// list changed, and the changes to alert; a repeat of a device's change
+    /// within `quiet` is not alerted.
+    fn update(&mut self, polled: Vec<Device>, now: Instant, quiet: Duration) -> (bool, Vec<(Device, bool)>) {
         let mut changed = false;
         let mut events = Vec::new();
         for device in &polled {
@@ -143,7 +152,7 @@ impl Tracker {
             if !self.connected.iter().any(|d| d.name == device.name) {
                 self.connected.push(device.clone());
                 changed = true;
-                if self.note_change(&device.name, true, now) {
+                if self.note_change(&device.name, true, now, quiet) {
                     events.push((device.clone(), true));
                 }
             }
@@ -163,7 +172,7 @@ impl Tracker {
             }
             self.missing_since.remove(&device.name);
             changed = true;
-            if self.note_change(&device.name, false, now) {
+            if self.note_change(&device.name, false, now, quiet) {
                 events.push((device, false));
             }
         }
@@ -173,10 +182,10 @@ impl Tracker {
 
     /// Records a connect or disconnect; whether to alert it. A device that
     /// keeps reconnecting alerts once, then stays quiet until it has
-    /// settled for `REPEAT_QUIET`.
-    fn note_change(&mut self, name: &str, connected: bool, now: Instant) -> bool {
+    /// settled for `quiet`.
+    fn note_change(&mut self, name: &str, connected: bool, now: Instant, quiet: Duration) -> bool {
         let last = self.last_change.insert((name.to_string(), connected), now);
-        !last.is_some_and(|t| now.duration_since(t) < REPEAT_QUIET)
+        !last.is_some_and(|t| now.duration_since(t) < quiet)
     }
 }
 
@@ -306,6 +315,8 @@ mod tests {
         assert_eq!(kind_from_appearance(0x0000), DeviceKind::Other);
     }
 
+    const QUIET: Duration = Duration::from_secs(5 * 60);
+
     fn buds() -> Device {
         Device { name: "Galaxy Buds2 Pro".into(), kind: DeviceKind::Headphones }
     }
@@ -315,14 +326,14 @@ mod tests {
         let t0 = Instant::now();
         let mut tracker = Tracker { connected: vec![buds()], ..Default::default() };
         // Gone for two polls, then back: nothing to report.
-        assert_eq!(tracker.update(vec![], t0), (false, vec![]));
-        assert_eq!(tracker.update(vec![], t0 + POLL), (false, vec![]));
-        assert_eq!(tracker.update(vec![buds()], t0 + POLL * 2), (false, vec![]));
+        assert_eq!(tracker.update(vec![], t0, QUIET), (false, vec![]));
+        assert_eq!(tracker.update(vec![], t0 + POLL, QUIET), (false, vec![]));
+        assert_eq!(tracker.update(vec![buds()], t0 + POLL * 2, QUIET), (false, vec![]));
         assert_eq!(tracker.connected, vec![buds()]);
         // Gone past the grace period: one disconnect.
         let t1 = t0 + Duration::from_secs(60);
-        assert_eq!(tracker.update(vec![], t1), (false, vec![]));
-        assert_eq!(tracker.update(vec![], t1 + DISCONNECT_GRACE), (true, vec![(buds(), false)]));
+        assert_eq!(tracker.update(vec![], t1, QUIET), (false, vec![]));
+        assert_eq!(tracker.update(vec![], t1 + DISCONNECT_GRACE, QUIET), (true, vec![(buds(), false)]));
         assert!(tracker.connected.is_empty());
     }
 
@@ -330,36 +341,51 @@ mod tests {
     fn repeated_reconnects_alert_once() {
         let t0 = Instant::now();
         let mut tracker = Tracker::default();
-        assert_eq!(tracker.update(vec![buds()], t0), (true, vec![(buds(), true)]));
+        assert_eq!(tracker.update(vec![buds()], t0, QUIET), (true, vec![(buds(), true)]));
         // Drops and comes back a few times: the first drop is alerted, the
         // rest only move the indicator.
         let mut t = t0;
         for round in 0..3 {
             t += Duration::from_secs(30);
-            tracker.update(vec![], t);
+            tracker.update(vec![], t, QUIET);
             t += DISCONNECT_GRACE;
             let alerted = if round == 0 { vec![(buds(), false)] } else { vec![] };
-            assert_eq!(tracker.update(vec![], t), (true, alerted));
+            assert_eq!(tracker.update(vec![], t, QUIET), (true, alerted));
             t += Duration::from_secs(30);
-            assert_eq!(tracker.update(vec![buds()], t), (true, vec![]));
+            assert_eq!(tracker.update(vec![buds()], t, QUIET), (true, vec![]));
         }
         // Settled long enough: alerts again.
-        t += REPEAT_QUIET;
-        tracker.update(vec![], t);
+        t += QUIET;
+        tracker.update(vec![], t, QUIET);
         t += DISCONNECT_GRACE;
-        assert_eq!(tracker.update(vec![], t), (true, vec![(buds(), false)]));
-        t += REPEAT_QUIET;
-        assert_eq!(tracker.update(vec![buds()], t), (true, vec![(buds(), true)]));
+        assert_eq!(tracker.update(vec![], t, QUIET), (true, vec![(buds(), false)]));
+        t += QUIET;
+        assert_eq!(tracker.update(vec![buds()], t, QUIET), (true, vec![(buds(), true)]));
+    }
+
+    #[test]
+    fn zero_quiet_alerts_every_change() {
+        let t0 = Instant::now();
+        let mut tracker = Tracker::default();
+        let mut t = t0;
+        for _ in 0..3 {
+            assert_eq!(tracker.update(vec![buds()], t, Duration::ZERO), (true, vec![(buds(), true)]));
+            t += Duration::from_secs(30);
+            tracker.update(vec![], t, Duration::ZERO);
+            t += DISCONNECT_GRACE;
+            assert_eq!(tracker.update(vec![], t, Duration::ZERO), (true, vec![(buds(), false)]));
+            t += Duration::from_secs(30);
+        }
     }
 
     #[test]
     fn connect_then_disconnect_both_alert() {
         let t0 = Instant::now();
         let mut tracker = Tracker::default();
-        assert_eq!(tracker.update(vec![buds()], t0), (true, vec![(buds(), true)]));
+        assert_eq!(tracker.update(vec![buds()], t0, QUIET), (true, vec![(buds(), true)]));
         let t1 = t0 + Duration::from_secs(60);
-        tracker.update(vec![], t1);
-        assert_eq!(tracker.update(vec![], t1 + DISCONNECT_GRACE), (true, vec![(buds(), false)]));
+        tracker.update(vec![], t1, QUIET);
+        assert_eq!(tracker.update(vec![], t1 + DISCONNECT_GRACE, QUIET), (true, vec![(buds(), false)]));
     }
 
     /// Lists what is connected now: `cargo test lists_connected -- --ignored --nocapture`.
