@@ -7,7 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::{Result, HSTRING};
 use windows::Devices::Bluetooth::{BluetoothConnectionStatus, BluetoothDevice, BluetoothLEDevice};
@@ -20,6 +20,11 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 pub const WM_BLUETOOTH: u32 = WM_APP + 6;
 
 const POLL: Duration = Duration::from_secs(2);
+/// A device must stay gone this long to count as disconnected.
+const DISCONNECT_GRACE: Duration = Duration::from_secs(8);
+/// After a device connects (or disconnects), the same change again within
+/// this time is not alerted; the indicator still follows it.
+const REPEAT_QUIET: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum DeviceKind {
@@ -88,33 +93,90 @@ fn run(hwnd: isize, state: Arc<Mutex<State>>) -> Result<()> {
     let mut kinds: HashMap<String, DeviceKind> = HashMap::new();
 
     // Whatever is connected at start-up shows in the indicator, without alerts.
-    let mut previous = connected(&classic, &le, &mut kinds);
-    state.lock().unwrap().connected = previous.iter().map(|(_, d)| d.clone()).collect();
+    let mut tracker = Tracker::default();
+    loop {
+        if let Some(now) = connected(&classic, &le, &mut kinds) {
+            tracker.connected = now;
+            break;
+        }
+        thread::sleep(POLL);
+    }
+    state.lock().unwrap().connected = tracker.connected.clone();
     post(hwnd);
 
     loop {
         thread::sleep(POLL);
-        let now = connected(&classic, &le, &mut kinds);
-        let mut events = Vec::new();
-        for (id, device) in &now {
-            if !previous.iter().any(|(old, _)| old == id) {
-                events.push((device.clone(), true));
-            }
-        }
-        for (id, device) in &previous {
-            if !now.iter().any(|(new, _)| new == id) {
-                events.push((device.clone(), false));
-            }
-        }
-        if events.is_empty() {
+        // A failed lookup says nothing about the devices; skip it rather
+        // than read it as everything disconnecting.
+        let Some(now) = connected(&classic, &le, &mut kinds) else { continue };
+        let (changed, events) = tracker.update(now, Instant::now());
+        if !changed {
             continue;
         }
         let mut state = state.lock().unwrap();
-        state.connected = now.iter().map(|(_, d)| d.clone()).collect();
+        state.connected = tracker.connected.clone();
         state.events.extend(events);
         drop(state);
-        previous = now;
         post(hwnd);
+    }
+}
+
+/// Turns polled device lists into connects and disconnects worth an alert.
+#[derive(Default)]
+struct Tracker {
+    /// Devices taken as connected (what the indicator shows).
+    connected: Vec<Device>,
+    /// Devices gone from the poll but still inside `DISCONNECT_GRACE`, by name.
+    missing_since: HashMap<String, Instant>,
+    /// Last connect or disconnect per (name, connected?), alerted or not.
+    last_change: HashMap<(String, bool), Instant>,
+}
+
+impl Tracker {
+    /// Takes the devices connected `now`. Returns whether the connected
+    /// list changed, and the changes to alert.
+    fn update(&mut self, polled: Vec<Device>, now: Instant) -> (bool, Vec<(Device, bool)>) {
+        let mut changed = false;
+        let mut events = Vec::new();
+        for device in &polled {
+            self.missing_since.remove(&device.name);
+            if !self.connected.iter().any(|d| d.name == device.name) {
+                self.connected.push(device.clone());
+                changed = true;
+                if self.note_change(&device.name, true, now) {
+                    events.push((device.clone(), true));
+                }
+            }
+        }
+        let mut kept = Vec::new();
+        for device in std::mem::take(&mut self.connected) {
+            if polled.iter().any(|d| d.name == device.name) {
+                kept.push(device);
+                continue;
+            }
+            // A device that drops for a moment (sleeping keyboards and
+            // mice, earbuds switching links) and comes back is no change.
+            let since = *self.missing_since.entry(device.name.clone()).or_insert(now);
+            if now.duration_since(since) < DISCONNECT_GRACE {
+                kept.push(device);
+                continue;
+            }
+            self.missing_since.remove(&device.name);
+            changed = true;
+            if self.note_change(&device.name, false, now) {
+                events.push((device, false));
+            }
+        }
+        self.connected = kept;
+        (changed, events)
+    }
+
+    /// Records a connect or disconnect; whether to alert it. A device that
+    /// keeps reconnecting alerts once, then stays quiet until it has
+    /// settled for `REPEAT_QUIET`.
+    fn note_change(&mut self, name: &str, connected: bool, now: Instant) -> bool {
+        let last = self.last_change.insert((name.to_string(), connected), now);
+        !last.is_some_and(|t| now.duration_since(t) < REPEAT_QUIET)
     }
 }
 
@@ -124,18 +186,17 @@ fn post(hwnd: isize) {
     }
 }
 
-/// Connected devices as (id, device). A device that is both classic and
-/// LE (common for earbuds) is listed once, by name.
-fn connected(classic: &HSTRING, le: &HSTRING, kinds: &mut HashMap<String, DeviceKind>) -> Vec<(String, Device)> {
-    let mut devices: Vec<(String, Device)> = Vec::new();
+/// Connected devices, or `None` if a lookup failed. A device that is both
+/// classic and LE (common for earbuds) is listed once, by name: its id
+/// differs between the two, so ids cannot tell devices apart.
+fn connected(classic: &HSTRING, le: &HSTRING, kinds: &mut HashMap<String, DeviceKind>) -> Option<Vec<Device>> {
+    let mut devices: Vec<Device> = Vec::new();
     for (selector, is_le) in [(classic, false), (le, true)] {
-        let Ok(found) = DeviceInformation::FindAllAsyncAqsFilter(selector).and_then(|op| op.get()) else {
-            continue;
-        };
+        let found = DeviceInformation::FindAllAsyncAqsFilter(selector).and_then(|op| op.get()).ok()?;
         for info in found {
             let (Ok(id), Ok(name)) = (info.Id(), info.Name()) else { continue };
             let (id, name) = (id.to_string(), name.to_string());
-            if name.is_empty() || devices.iter().any(|(_, d)| d.name == name) {
+            if name.is_empty() || devices.iter().any(|d| d.name == name) {
                 continue;
             }
             let kind = *kinds.entry(id.clone()).or_insert_with(|| match lookup_kind(&id, is_le) {
@@ -143,10 +204,10 @@ fn connected(classic: &HSTRING, le: &HSTRING, kinds: &mut HashMap<String, Device
                 DeviceKind::Other => kind_from_name(&name),
                 kind => kind,
             });
-            devices.push((id, Device { name, kind }));
+            devices.push(Device { name, kind });
         }
     }
-    devices
+    Some(devices)
 }
 
 fn lookup_kind(id: &str, is_le: bool) -> DeviceKind {
@@ -245,6 +306,62 @@ mod tests {
         assert_eq!(kind_from_appearance(0x0000), DeviceKind::Other);
     }
 
+    fn buds() -> Device {
+        Device { name: "Galaxy Buds2 Pro".into(), kind: DeviceKind::Headphones }
+    }
+
+    #[test]
+    fn brief_drops_are_no_change() {
+        let t0 = Instant::now();
+        let mut tracker = Tracker { connected: vec![buds()], ..Default::default() };
+        // Gone for two polls, then back: nothing to report.
+        assert_eq!(tracker.update(vec![], t0), (false, vec![]));
+        assert_eq!(tracker.update(vec![], t0 + POLL), (false, vec![]));
+        assert_eq!(tracker.update(vec![buds()], t0 + POLL * 2), (false, vec![]));
+        assert_eq!(tracker.connected, vec![buds()]);
+        // Gone past the grace period: one disconnect.
+        let t1 = t0 + Duration::from_secs(60);
+        assert_eq!(tracker.update(vec![], t1), (false, vec![]));
+        assert_eq!(tracker.update(vec![], t1 + DISCONNECT_GRACE), (true, vec![(buds(), false)]));
+        assert!(tracker.connected.is_empty());
+    }
+
+    #[test]
+    fn repeated_reconnects_alert_once() {
+        let t0 = Instant::now();
+        let mut tracker = Tracker::default();
+        assert_eq!(tracker.update(vec![buds()], t0), (true, vec![(buds(), true)]));
+        // Drops and comes back a few times: the first drop is alerted, the
+        // rest only move the indicator.
+        let mut t = t0;
+        for round in 0..3 {
+            t += Duration::from_secs(30);
+            tracker.update(vec![], t);
+            t += DISCONNECT_GRACE;
+            let alerted = if round == 0 { vec![(buds(), false)] } else { vec![] };
+            assert_eq!(tracker.update(vec![], t), (true, alerted));
+            t += Duration::from_secs(30);
+            assert_eq!(tracker.update(vec![buds()], t), (true, vec![]));
+        }
+        // Settled long enough: alerts again.
+        t += REPEAT_QUIET;
+        tracker.update(vec![], t);
+        t += DISCONNECT_GRACE;
+        assert_eq!(tracker.update(vec![], t), (true, vec![(buds(), false)]));
+        t += REPEAT_QUIET;
+        assert_eq!(tracker.update(vec![buds()], t), (true, vec![(buds(), true)]));
+    }
+
+    #[test]
+    fn connect_then_disconnect_both_alert() {
+        let t0 = Instant::now();
+        let mut tracker = Tracker::default();
+        assert_eq!(tracker.update(vec![buds()], t0), (true, vec![(buds(), true)]));
+        let t1 = t0 + Duration::from_secs(60);
+        tracker.update(vec![], t1);
+        assert_eq!(tracker.update(vec![], t1 + DISCONNECT_GRACE), (true, vec![(buds(), false)]));
+    }
+
     /// Lists what is connected now: `cargo test lists_connected -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -252,9 +369,9 @@ mod tests {
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap() };
         let classic = BluetoothDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected).unwrap();
         let le = BluetoothLEDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected).unwrap();
-        let devices = connected(&classic, &le, &mut HashMap::new());
+        let devices = connected(&classic, &le, &mut HashMap::new()).expect("lookup");
         println!("{} connected", devices.len());
-        for (_, d) in devices {
+        for d in devices {
             println!("  {:?} ({:?})", d.name, d.kind);
         }
     }

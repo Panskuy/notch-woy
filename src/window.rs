@@ -1,10 +1,11 @@
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use tiny_skia::Pixmap;
 use windows::core::{w, Error, Result};
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Dwm::{DwmFlush, DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::Win32::Graphics::Dwm::{DwmFlush, DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -76,6 +77,17 @@ fn rubber_band(raw: f32) -> f32 {
 /// window changes.
 const RECHECK_TIMER: usize = 3;
 const RECHECK_MS: u32 = 250;
+
+/// While hidden for a full-screen app, looks again this often, so the
+/// notch comes back even if the event that should bring it back is missed
+/// (the app closes without another taking its place, a busy moment at
+/// login...).
+const HIDDEN_RECHECK_TIMER: usize = 6;
+const HIDDEN_RECHECK_MS: u32 = 1000;
+
+/// The notch window, for window events that arrive while the app state is
+/// busy and must be retried.
+static NOTCH_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// Ends an alert after it has been shown this long.
 const ALERT_TIMER: usize = 2;
@@ -334,6 +346,7 @@ pub fn run() -> Result<()> {
         // Read ahead so the picker opens with the list already there.
         app.outputs.refresh();
         APP.with_borrow_mut(|slot| *slot = Some(app));
+        NOTCH_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
         tray::add(hwnd);
         volume_keys::install(hwnd);
         with_app(App::relayout).transpose()?;
@@ -405,7 +418,7 @@ unsafe extern "system" fn on_window_event(
     if object_event && (object != OBJID_WINDOW.0 || hwnd != unsafe { GetForegroundWindow() }) {
         return;
     }
-    with_app(|app| {
+    let handled = with_app(|app| {
         app.update_obstruction();
         if event == EVENT_SYSTEM_FOREGROUND {
             // Some apps size themselves just after activating; look again.
@@ -414,6 +427,16 @@ unsafe extern "system" fn on_window_event(
             }
         }
     });
+    // The state was borrowed (the hook ran inside another handler): look
+    // shortly instead of dropping the change.
+    if handled.is_none() {
+        let notch = NOTCH_HWND.load(Ordering::Relaxed);
+        if notch != 0 {
+            unsafe {
+                SetTimer(Some(HWND(notch as _)), RECHECK_TIMER, RECHECK_MS, None);
+            }
+        }
+    }
 }
 
 /// The visible frame of an ordinary app window: `None` for hidden or
@@ -428,6 +451,25 @@ fn app_frame(hwnd: HWND) -> Option<RECT> {
         let len = GetClassNameW(hwnd, &mut class) as usize;
         let class = String::from_utf16_lossy(&class[..len]);
         if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+            return None;
+        }
+        // Screen-sized overlays that are no app: GPU overlays (NVIDIA's is
+        // NOACTIVATE), the pen canvas (TRANSPARENT), and shell windows kept
+        // "visible" but cloaked (the touch keyboard's host). Any of them
+        // can be the active window right after login, and would otherwise
+        // count as a full-screen app and hide the notch.
+        let ex = WINDOW_EX_STYLE(GetWindowLongW(hwnd, GWL_EXSTYLE) as u32);
+        if ex.contains(WS_EX_NOACTIVATE) || ex.contains(WS_EX_TRANSPARENT) {
+            return None;
+        }
+        let mut cloaked = 0u32;
+        let got = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut _,
+            size_of::<u32>() as u32,
+        );
+        if got.is_ok() && cloaked != 0 {
             return None;
         }
         // Without the invisible resize borders.
@@ -506,6 +548,14 @@ mod tests {
             let desktop = GetShellWindow();
             println!("desktop full screen {}", fills(desktop, m));
             assert!(!fills(desktop, m));
+            // Nor screen-sized overlays: NVIDIA's, the pen canvas, the
+            // cloaked touch keyboard host. Checked when present.
+            for class in [w!("CEF-OSC-WIDGET"), w!("ShellHandwritingCanvas"), w!("Windows.UI.Core.CoreWindow")] {
+                if let Ok(overlay) = FindWindowW(class, None) {
+                    println!("{} full screen {}", class.display(), fills(overlay, m));
+                    assert!(!fills(overlay, m));
+                }
+            }
         }
     }
 }
@@ -673,7 +723,23 @@ impl App {
         if fullscreen != self.fullscreen {
             self.fullscreen = fullscreen;
             unsafe {
-                let _ = ShowWindow(self.hwnd, if fullscreen { SW_HIDE } else { SW_SHOWNOACTIVATE });
+                if fullscreen {
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                    SetTimer(Some(self.hwnd), HIDDEN_RECHECK_TIMER, HIDDEN_RECHECK_MS, None);
+                } else {
+                    let _ = KillTimer(Some(self.hwnd), HIDDEN_RECHECK_TIMER);
+                    // Back on top too: windows raised while it was hidden
+                    // (other topmost ones) must not cover it.
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        Some(HWND_TOPMOST),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    );
+                }
             }
             if fullscreen {
                 self.hide_shadow();
@@ -1565,6 +1631,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             if let Some(Err(e)) = with_app(App::relayout) {
                 eprintln!("relayout failed: {e}");
             }
+            // The monitor's bounds changed (resolution or scale settling at
+            // login): what fills or covers it must be judged again.
+            with_app(App::update_obstruction);
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -1706,6 +1775,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             unsafe {
                 let _ = KillTimer(Some(hwnd), RECHECK_TIMER);
             }
+            with_app(App::update_obstruction);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == HIDDEN_RECHECK_TIMER => {
             with_app(App::update_obstruction);
             LRESULT(0)
         }

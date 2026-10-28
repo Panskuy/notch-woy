@@ -82,6 +82,10 @@ Requires Windows 10 or 11, 64-bit.
   in their on-screen menu.
 - New notifications are checked every 0.7 s and Bluetooth connections every
   2 s, so they can appear slightly after Windows shows them.
+- **Bluetooth alerts** skip devices that drop for a few seconds and come
+  back (sleeping keyboards and mice). A device that keeps reconnecting
+  alerts once, then stays quiet until it has settled for 5 minutes; the
+  indicator still follows it.
 
 ## Building from source
 
