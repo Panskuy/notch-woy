@@ -33,8 +33,12 @@ use crate::anim::Spring;
 use crate::autostart;
 use crate::battery::{self, Battery};
 use crate::render::Fonts;
-use crate::settings::{bluetooth_quiet_label, AlertDuration, AlertKind, NotchWidth, Settings, BLUETOOTH_QUIET_MINUTES};
-use crate::settings_ui::{self, focus_order, segments, switch_index, Control, Hit, Pane, PreviewCache, Theme, View};
+use crate::settings::{
+    bluetooth_quiet_label, AlertDuration, AlertKind, NotchWidth, OpenSize, Page, Settings, BLUETOOTH_QUIET_MINUTES,
+};
+use crate::settings_ui::{
+    self, focus_order, segments, switch_index, Control, Hit, Pane, PreviewCache, Theme, View, SWITCHES,
+};
 
 /// Posted to the notch window when a setting changes; `wparam` is
 /// `Settings::to_bits`.
@@ -62,12 +66,18 @@ struct Ui {
     settings: Settings,
     battery: Option<Battery>,
     /// Per switch (`settings_ui::switch_index`), how far on, 0..100.
-    switches: [Spring; 6],
+    switches: [Spring; SWITCHES],
     /// Segment selections, in segment index x 100.
     width_selection: Spring,
+    open_size_selection: Spring,
     duration_selection: Spring,
     /// The preview notch's width, logical px.
     preview_width: Spring,
+    /// Per page (`Page as usize`), its place on the Layout stage, x 100.
+    page_rows: [Spring; 3],
+    /// A page's card pressed on the Layout stage, being (or about to be)
+    /// dragged into another place.
+    page_drag: Option<PageDrag>,
     focus: Control,
     /// The focus ring shows after keyboard use, as in Windows and macOS.
     focus_visible: bool,
@@ -77,6 +87,22 @@ struct Ui {
     animating: bool,
     last_tick: Instant,
 }
+
+/// A press on a page's card in the Layout pane.
+#[derive(Clone, Copy)]
+struct PageDrag {
+    page: Page,
+    /// Pointer x (logical) when pressed, and the card's left edge then.
+    from_x: f32,
+    card_x: f32,
+    /// Moved far enough to count as a drag, not a click.
+    moving: bool,
+    /// The order it would make if let go now.
+    order: [Page; 3],
+}
+
+/// Pointer travel (logical px) that turns a press on a card into a drag.
+const DRAG_START: f32 = 3.0;
 
 thread_local! {
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
@@ -159,13 +185,16 @@ fn create(notch: HWND) -> windows::core::Result<()> {
         let settings = Settings::load();
         let battery = battery::read();
         let autostart = autostart::is_enabled();
-        let mut switches = [Spring::smooth(0.0); 6];
+        let mut switches = [Spring::smooth(0.0); SWITCHES];
         for kind in AlertKind::ALL {
             if let Some(i) = switch_index(Control::Alert(kind)) {
                 switches[i] = Spring::smooth(if settings.alert_enabled(kind) { 100.0 } else { 0.0 });
             }
         }
         switches[AlertKind::ALL.len()] = Spring::smooth(if autostart { 100.0 } else { 0.0 });
+        if let Some(i) = switch_index(Control::Plugins) {
+            switches[i] = Spring::smooth(if settings.plugins { 100.0 } else { 0.0 });
+        }
         let theme = system_theme();
         let ui = Ui {
             hwnd,
@@ -180,8 +209,11 @@ fn create(notch: HWND) -> windows::core::Result<()> {
             battery,
             switches,
             width_selection: Spring::smooth(width_index(settings) as f32 * 100.0),
+            open_size_selection: Spring::smooth(open_size_index(settings) as f32 * 100.0),
             duration_selection: Spring::smooth(duration_index(settings) as f32 * 100.0),
             preview_width: Spring::new(settings_ui::preview_width(settings, battery.is_some())),
+            page_rows: page_places(settings.page_order).map(|place| Spring::smooth(place * 100.0)),
+            page_drag: None,
             focus: Control::Sidebar,
             focus_visible: false,
             hover: None,
@@ -204,6 +236,15 @@ fn create(notch: HWND) -> windows::core::Result<()> {
 
 fn width_index(settings: Settings) -> usize {
     NotchWidth::ALL.iter().position(|&w| w == settings.width).unwrap_or(0)
+}
+
+/// Per page (`Page as usize`), its place (0 = left) in `order`.
+fn page_places(order: [Page; 3]) -> [f32; 3] {
+    Page::ALL.map(|page| order.iter().position(|&p| p == page).unwrap_or(0) as f32)
+}
+
+fn open_size_index(settings: Settings) -> usize {
+    OpenSize::ALL.iter().position(|&s| s == settings.open_size).unwrap_or(0)
 }
 
 fn duration_index(settings: Settings) -> usize {
@@ -270,6 +311,8 @@ fn center(hwnd: HWND, dpi: u32, at: POINT) {
 /// run with the state released.
 enum Modal {
     BluetoothMenu,
+    /// The pages, to pick the one the notch opens on.
+    StartPageMenu,
     ConfirmReset,
     Close,
 }
@@ -282,8 +325,11 @@ impl Ui {
             settings: self.settings,
             switches: self.switches.map(|s| s.value / 100.0),
             width_selection: self.width_selection.value / 100.0,
+            open_size_selection: self.open_size_selection.value / 100.0,
             duration_selection: self.duration_selection.value / 100.0,
             preview_width: self.preview_width.value,
+            page_rows: self.page_rows.each_ref().map(|s| s.value / 100.0),
+            page_dragging: self.page_drag.filter(|d| d.moving).map(|d| d.page),
             battery: self.battery,
             time: crate::window::clock_text(),
             focus: self.focus_visible.then_some(self.focus),
@@ -301,7 +347,13 @@ impl Ui {
     fn springs(&mut self) -> impl Iterator<Item = &mut Spring> {
         self.switches
             .iter_mut()
-            .chain([&mut self.width_selection, &mut self.duration_selection, &mut self.preview_width])
+            .chain([
+                &mut self.width_selection,
+                &mut self.open_size_selection,
+                &mut self.duration_selection,
+                &mut self.preview_width,
+            ])
+            .chain(self.page_rows.iter_mut())
     }
 
     /// Has the message loop run frames while a spring has somewhere to go.
@@ -348,9 +400,16 @@ impl Ui {
                 self.switches[i].target = if settings.alert_enabled(kind) { 100.0 } else { 0.0 };
             }
         }
+        if let Some(i) = switch_index(Control::Plugins) {
+            self.switches[i].target = if settings.plugins { 100.0 } else { 0.0 };
+        }
         self.width_selection.target = width_index(settings) as f32 * 100.0;
+        self.open_size_selection.target = open_size_index(settings) as f32 * 100.0;
         self.duration_selection.target = duration_index(settings) as f32 * 100.0;
         self.preview_width.target = settings_ui::preview_width(settings, self.battery.is_some());
+        for (row, place) in self.page_rows.iter_mut().zip(page_places(settings.page_order)) {
+            row.target = place * 100.0;
+        }
         self.animate();
     }
 
@@ -386,6 +445,16 @@ impl Ui {
                 self.focus = Control::Alert(kind);
                 self.commit(next);
             }
+            Hit::Control(Control::Plugins) => {
+                let mut next = self.settings;
+                next.plugins = !next.plugins;
+                self.focus = Control::Plugins;
+                self.commit(next);
+            }
+            Hit::Control(Control::PluginsFolder) => {
+                self.focus = Control::PluginsFolder;
+                crate::plugins::open_folder();
+            }
             Hit::Control(Control::Autostart) => {
                 self.focus = Control::Autostart;
                 if let Err(e) = autostart::set_enabled(!autostart::is_enabled()) {
@@ -398,6 +467,7 @@ impl Ui {
                 let mut next = self.settings;
                 match control {
                     Control::Width => next.width = NotchWidth::ALL[i.min(NotchWidth::ALL.len() - 1)],
+                    Control::OpenSize => next.open_size = OpenSize::ALL[i.min(OpenSize::ALL.len() - 1)],
                     Control::Duration => next.duration = AlertDuration::ALL[i.min(AlertDuration::ALL.len() - 1)],
                     _ => return None,
                 }
@@ -410,11 +480,25 @@ impl Ui {
                 self.focus = Control::BluetoothQuiet;
                 return Some(Modal::BluetoothMenu);
             }
+            Hit::Control(Control::StartPage) => {
+                self.focus = Control::StartPage;
+                return Some(Modal::StartPageMenu);
+            }
+            // A card clicked (not dragged: see `on_page_drag`): the notch
+            // opens on its page.
+            Hit::Control(Control::PageRow(i)) => {
+                self.focus = Control::PageRow(i);
+                let mut next = self.settings;
+                next.start_page = next.page_order[i.min(2)];
+                if next != self.settings {
+                    self.commit(next);
+                }
+            }
             Hit::Control(Control::Reset) => {
                 self.focus = Control::Reset;
                 return Some(Modal::ConfirmReset);
             }
-            Hit::Control(Control::Sidebar | Control::Width | Control::Duration) => {}
+            Hit::Control(Control::Sidebar | Control::Width | Control::OpenSize | Control::Duration) => {}
         }
         self.invalidate();
         None
@@ -438,9 +522,10 @@ impl Ui {
                 let next = (i + if key == VK_UP { -1 } else { 1 }).clamp(0, Pane::ALL.len() as i32 - 1);
                 self.set_pane(Pane::ALL[next as usize]);
             }
-            VK_LEFT | VK_RIGHT if matches!(self.focus, Control::Width | Control::Duration) => {
+            VK_LEFT | VK_RIGHT if matches!(self.focus, Control::Width | Control::OpenSize | Control::Duration) => {
                 let current = match self.focus {
                     Control::Width => width_index(self.settings),
+                    Control::OpenSize => open_size_index(self.settings),
                     _ => duration_index(self.settings),
                 } as i32;
                 let next = (current + if key == VK_LEFT { -1 } else { 1 }).clamp(0, segments(self.focus) as i32 - 1);
@@ -448,14 +533,73 @@ impl Ui {
             }
             VK_SPACE | VK_RETURN => match self.focus {
                 Control::Sidebar => {}
-                Control::Width | Control::Duration => {}
+                Control::Width | Control::OpenSize | Control::Duration => {}
                 control => return self.activate(Hit::Control(control)),
             },
             VK_DOWN if self.focus == Control::BluetoothQuiet => return Some(Modal::BluetoothMenu),
+            VK_DOWN if self.focus == Control::StartPage => return Some(Modal::StartPageMenu),
+            // A focused page's card moves left or right.
+            VK_LEFT | VK_RIGHT if matches!(self.focus, Control::PageRow(_)) => {
+                let Control::PageRow(i) = self.focus else { unreachable!() };
+                let to = if key == VK_LEFT { i.checked_sub(1) } else { Some(i + 1).filter(|&j| j < 3) };
+                if let Some(to) = to {
+                    let mut next = self.settings;
+                    next.page_order.swap(i, to);
+                    self.focus = Control::PageRow(to);
+                    self.commit(next);
+                }
+            }
             _ => {}
         }
         self.invalidate();
         None
+    }
+
+    /// The pointer moved with a page's card pressed: once past
+    /// `DRAG_START` the card follows it, and the others slide aside to make
+    /// room where it would land.
+    fn on_page_drag(&mut self, x: f32) {
+        let Some(mut drag) = self.page_drag else { return };
+        if !drag.moving && (x - drag.from_x).abs() < DRAG_START {
+            return;
+        }
+        drag.moving = true;
+        // Where the card is, in places, held a little within the stage.
+        let first = settings_ui::page_card(0.0).x;
+        let place = ((drag.card_x + x - drag.from_x - first) / settings_ui::PAGE_PITCH).clamp(-0.35, 2.35);
+        drag.order = settings_ui::reorder(self.settings.page_order, drag.page, place);
+        for (page, target) in Page::ALL.into_iter().zip(page_places(drag.order)) {
+            let row = &mut self.page_rows[page as usize];
+            if page == drag.page {
+                // The dragged row stays under the pointer.
+                *row = Spring::smooth(place * 100.0);
+            } else {
+                row.target = target * 100.0;
+            }
+        }
+        self.page_drag = Some(drag);
+        self.animate();
+        self.invalidate();
+    }
+
+    /// Lets go of a page row: a drag puts the page where it was dropped.
+    fn finish_page_drag(&mut self) {
+        let Some(drag) = self.page_drag.take() else { return };
+        if drag.moving {
+            let mut next = self.settings;
+            next.page_order = drag.order;
+            self.focus = Control::PageRow(drag.order.iter().position(|&p| p == drag.page).unwrap_or(0));
+            if next != self.settings {
+                self.commit(next);
+            } else {
+                // Back where it was: settle into place.
+                for (row, place) in self.page_rows.iter_mut().zip(page_places(self.settings.page_order)) {
+                    row.target = place * 100.0;
+                }
+                self.animate();
+            }
+        }
+        self.invalidate();
     }
 
     fn logical(&self, lparam: LPARAM) -> (f32, f32) {
@@ -553,6 +697,24 @@ fn run_modal(hwnd: HWND, modal: Modal) {
                 ui.invalidate();
             });
         }
+        Modal::StartPageMenu => {
+            let Some((settings, anchor)) = with_ui(|ui| {
+                let rect = settings_ui::control_rect(ui.pane, Control::StartPage);
+                let anchor = rect.map(|r| POINT { x: (r.x * ui.scale) as i32, y: ((r.y + r.h + 4.0) * ui.scale) as i32 });
+                (ui.settings, anchor.unwrap_or_default())
+            }) else {
+                return;
+            };
+            let Some(page) = start_page_menu(hwnd, settings, anchor) else { return };
+            with_ui(|ui| {
+                let mut next = ui.settings;
+                next.start_page = page;
+                if next != ui.settings {
+                    ui.commit(next);
+                }
+                ui.invalidate();
+            });
+        }
         Modal::Close => unsafe {
             let _ = DestroyWindow(hwnd);
         },
@@ -569,6 +731,24 @@ fn run_modal(hwnd: HWND, modal: Modal) {
                 with_ui(|ui| ui.commit(Settings::default()));
             }
         }
+    }
+}
+
+/// The pages, in their order, as a menu under the Opens To pop-up at
+/// `anchor` (client px); the chosen page, if any.
+fn start_page_menu(hwnd: HWND, settings: Settings, mut anchor: POINT) -> Option<Page> {
+    unsafe {
+        let menu = CreatePopupMenu().ok()?;
+        for (i, page) in settings.page_order.into_iter().enumerate() {
+            let checked = if page == settings.start_page { MF_CHECKED } else { MF_UNCHECKED };
+            let label: Vec<u16> = page.label().encode_utf16().chain(Some(0)).collect();
+            let _ = AppendMenuW(menu, MF_STRING | checked, i + 1, PCWSTR(label.as_ptr()));
+        }
+        let _ = ClientToScreen(hwnd, &mut anchor);
+        let choice = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, anchor.x, anchor.y, None, hwnd, None);
+        let _ = DestroyMenu(menu);
+        let index = (choice.0 as usize).checked_sub(1)?;
+        settings.page_order.get(index).copied()
     }
 }
 
@@ -616,6 +796,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     };
                     ui.tracking_leave = unsafe { TrackMouseEvent(&mut track) }.is_ok();
                 }
+                if ui.page_drag.is_some() {
+                    ui.on_page_drag(ui.logical(lparam).0);
+                    return;
+                }
                 let hover = settings_ui::hit(ui.pane, ui.logical(lparam));
                 if hover != ui.hover {
                     ui.hover = hover;
@@ -636,7 +820,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_LBUTTONDOWN => {
             with_ui(|ui| {
                 ui.focus_visible = false;
+                let (x, _) = ui.logical(lparam);
                 ui.pressed = settings_ui::hit(ui.pane, ui.logical(lparam));
+                if let Some(Hit::Control(Control::PageRow(i))) = ui.pressed {
+                    let card_x = settings_ui::page_card(i as f32).x;
+                    let page = ui.settings.page_order[i];
+                    ui.page_drag = Some(PageDrag { page, from_x: x, card_x, moving: false, order: ui.settings.page_order });
+                }
                 unsafe {
                     SetCapture(hwnd);
                 }
@@ -650,6 +840,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let _ = ReleaseCapture();
                 }
                 let pressed = ui.pressed.take();
+                if ui.page_drag.is_some_and(|d| d.moving) {
+                    ui.finish_page_drag();
+                    return None;
+                }
+                ui.page_drag = None;
                 let released = settings_ui::hit(ui.pane, ui.logical(lparam));
                 ui.invalidate();
                 // Only a click that starts and ends on the same thing counts.

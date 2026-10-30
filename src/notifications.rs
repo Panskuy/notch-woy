@@ -44,11 +44,17 @@ pub struct Toast {
     pub app_id: String,
     /// The icon's main color, for the card's glow.
     pub tint: Option<Rgb>,
+    /// Opened on click instead of the app, when set: a plugin's `href`.
+    pub link: Option<String>,
 }
 
 impl Toast {
     /// Brings up the app that sent the notification.
     pub fn open_app(&self) {
+        if let Some(link) = &self.link {
+            crate::plugins::open_link(link);
+            return;
+        }
         if self.app_id.is_empty() {
             return;
         }
@@ -155,7 +161,7 @@ fn read(n: &UserNotification) -> Option<Toast> {
 
     let tint = icon.as_ref().map(palette::tint);
     let icon_is_tile = icon.as_ref().is_some_and(is_tile);
-    Some(Toast { app, title, body, icon, icon_is_tile, app_id, tint })
+    Some(Toast { app, title, body, icon, icon_is_tile, app_id, tint, link: None })
 }
 
 /// Crops the transparent margin app logos come with (often half the

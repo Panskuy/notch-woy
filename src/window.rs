@@ -6,7 +6,9 @@ use std::time::{Duration, Instant, SystemTime};
 use tiny_skia::Pixmap;
 use windows::core::{w, Error, Result, PCWSTR};
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Dwm::{DwmFlush, DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::Win32::Graphics::Dwm::{
+    DwmFlush, DwmGetCompositionTimingInfo, DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWM_TIMING_INFO,
+};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Globalization::{GetTimeFormatEx, TIME_NOSECONDS, TIME_NOTIMEMARKER};
@@ -23,28 +25,30 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::anim::Spring;
 use crate::battery::{self, Battery};
 use crate::bluetooth::{Bluetooth, Device, WM_BLUETOOTH};
-use crate::controls::{ControlCommand, ControlState, Controls, WM_CONTROLS};
+use crate::controls::{ControlCommand, ControlState, Controls, DisplayLevel, WM_CONTROLS};
 use crate::volume::{Volume, WM_VOLUME};
 use crate::volume_keys::{self, VolumeKey, WM_VOLUME_KEY};
 use crate::lyrics::{Fetcher, LyricsState, Query, WM_LYRICS};
 use crate::media::{self, Command, Media, NowPlaying, WM_MEDIA};
 use crate::meter::{Bars, Meter};
-use crate::notifications::{Notifications, WM_TOAST};
+use crate::notifications::{Notifications, Toast, WM_TOAST};
 use crate::outputs::{Output, Outputs, WM_OUTPUTS};
-use crate::settings::{AlertKind, Settings};
+use crate::plugins::{Plugins, WM_PLUGIN};
+use crate::settings::{AlertKind, Page, Settings};
 use crate::shelf::{self, Shelf, WM_SHELF};
 use crate::settings_window::{self, WM_SETTINGS_CHANGED};
 use crate::tray::{self, WM_TRAY};
 use crate::render::{
-    self, Alert, Arrival, Button, ControlHit, ControlsView, Fonts, LyricsView, OutputsView, Scene, Shape, ShelfHit, ShelfView,
+    self, Alert, Arrival, Button, Departure, ControlHit, ControlsView, Fonts, LyricsView, OutputsView, Scene, Shape, ShelfHit, ShelfView,
     Slider, Toggle,
     OUTPUT_ROWS_SHOWN,
     Transition, COLLAPSED, COLLAPSED_BATTERY_WIDTH, EXPANDED, MINI, PLAYER_ONLY_WIDTH, SHADOW_PAD,
 };
 
-/// Window canvas in logical pixels. It fits the expanded notch plus spring
-/// overshoot; fully transparent pixels let mouse clicks pass through.
-const WIN_W: f32 = 600.0;
+/// Window canvas in logical pixels. It fits the widest open notch (Control
+/// Center at the Large open size: 560 x 1.1, its shoulders and spring
+/// overshoot); fully transparent pixels let mouse clicks pass through.
+const WIN_W: f32 = 660.0;
 const WIN_H: f32 = 200.0;
 
 /// Longest frame step fed to the springs, so a stall does not make them jump.
@@ -55,20 +59,19 @@ const TRACK_TRANSITION: Duration = Duration::from_millis(600);
 /// Ticks the progress bar and synced lyrics while the notch is open.
 const PROGRESS_TIMER: usize = 1;
 const PROGRESS_INTERVAL_MS: u32 = 100;
-/// The same tick while synced lyrics show and play: the sung line lights
-/// up character by character, which needs ~30 fps to look smooth.
-const LYRICS_INTERVAL_MS: u32 = 33;
 
 /// Fires once a touchpad scroll has been still this long: the fingers
 /// lifted, so the pages settle.
 const SCROLL_END_TIMER: usize = 4;
 const SCROLL_END_MS: u32 = 120;
 
-/// Animates the resting notch's equalizer while a track plays. Its own
-/// ~30 fps tick rather than the frame loop: the bars are tiny, and it can
-/// run for hours.
-const EQUALIZER_TIMER: usize = 5;
-const EQUALIZER_INTERVAL_MS: u32 = 33;
+/// Animations that can run for hours (the resting notch's equalizer, the
+/// sung lyric lighting up) are drawn on the display's vsync like the rest,
+/// so they move evenly, but only about this often: every
+/// `round(refresh / AMBIENT_FPS)`-th refresh (60 fps on a 60, 120 or 180 Hz
+/// display, 72 on 144 Hz). A timer instead would fire unevenly (measured
+/// 8 to 38 ms for 16 ms) and drift against the display.
+const AMBIENT_FPS: f32 = 60.0;
 /// The time of day as Windows formats it for the user (12 or 24 hours),
 /// without seconds or AM/PM, as on the iPhone ("9:41").
 pub fn clock_text() -> String {
@@ -228,9 +231,8 @@ struct App {
     started: Instant,
     /// The resting notch's clock text; see `clock_text`.
     time: String,
-    /// The open notch's tick (`PROGRESS_TIMER`) interval, ms; 0 when not
-    /// armed yet.
-    progress_interval: u32,
+    /// Every how many refreshes ambient animations draw; see `AMBIENT_FPS`.
+    ambient_every: u32,
     /// Volume alert slider, in percent.
     volume: Spring,
     notifications: Notifications,
@@ -240,8 +242,8 @@ struct App {
     audio: Volume,
     controls: Controls,
     control_state: ControlState,
-    /// Open notch page, side by side: -100 (shelf, left), 0 (player),
-    /// 100 (Control Center, right).
+    /// Open notch page, side by side: -100 (left), 0 (middle), 100
+    /// (right); which page is where is `Settings::page_order`.
     page: Spring,
     /// While a touchpad drags the pages: where the fingers have taken them
     /// (-100..100, unclamped), before rubber-banding.
@@ -250,6 +252,15 @@ struct App {
     page_drag_rightward: bool,
     /// A Control Center slider being dragged, with its value (0..1).
     slider_drag: Option<(Slider, f32)>,
+    /// The screens whose brightness can be set, as last read.
+    displays: Vec<DisplayLevel>,
+    /// The Displays sheet (each screen's brightness) is open over the
+    /// Control Center.
+    displays_open: bool,
+    /// How far it is shown, 0..100.
+    displays_reveal: Spring,
+    /// A screen's slider in it being dragged, with its value (0..1).
+    display_drag: Option<(usize, f32)>,
     /// Per toggle (`Toggle::index`), how switched on it looks, 0..100;
     /// eases the color change.
     toggle_on: [Spring; 4],
@@ -262,8 +273,10 @@ struct App {
     fullscreen: bool,
     /// The primary monitor's bounds, in physical pixels.
     monitor: RECT,
-    /// `EQUALIZER_TIMER` is running.
+    /// The resting notch's equalizer is on screen and moving.
     equalizer_ticking: bool,
+    /// Runs the plugins folder's scripts while enabled in Settings.
+    plugins: Plugins,
     /// The output's peak meter and the equalizer bars made from it.
     meter: Meter,
     bars: Bars,
@@ -303,10 +316,18 @@ struct App {
     drop_hover: bool,
     /// How far the drop zone is lit up, 0..100; follows `drop_hover`.
     drop_glow: Spring,
+    /// Files taken off the shelf, flying into the bin: when each is thrown
+    /// (later for the ones waiting their turn), its icon, and where it was.
+    shelf_departures: Vec<Thrown>,
+    /// When a file was taken off, and its index: the gap closing.
+    shelf_closing: Option<(Instant, usize)>,
     /// Files just dropped on the shelf: when, how many, and where (logical
     /// canvas px) they were let go.
     shelf_arrival: Option<(Instant, usize, (f32, f32))>,
 }
+
+/// A file thrown off the shelf: when, its icon, and where it was.
+type Thrown = (Instant, Option<std::sync::Arc<Pixmap>>, (f32, f32));
 
 /// Hands drags over the notch to the app.
 struct NotchDrop;
@@ -426,7 +447,7 @@ pub fn run() -> Result<()> {
             alert_transition: None,
             started: Instant::now(),
             time: clock_text(),
-            progress_interval: 0,
+            ambient_every: ambient_every(),
             volume: Spring::new(0.0),
             notifications: Notifications::spawn(hwnd),
             bluetooth: Bluetooth::spawn(hwnd, settings.bluetooth_quiet()),
@@ -434,16 +455,21 @@ pub fn run() -> Result<()> {
             audio: Volume::spawn(hwnd),
             controls: Controls::spawn(hwnd),
             control_state: ControlState::default(),
-            page: Spring::smooth(0.0),
+            page: Spring::smooth(page_slot(settings, settings.start_page)),
             page_drag: None,
             page_drag_rightward: false,
             slider_drag: None,
+            displays: Vec::new(),
+            displays_open: false,
+            displays_reveal: Spring::new(0.0),
+            display_drag: None,
             toggle_on: [Spring::smooth(0.0); 4],
             toggle_press: [Spring::new(100.0); 4],
             obstructed: false,
             fullscreen: false,
             monitor: RECT::default(),
             equalizer_ticking: false,
+            plugins: Plugins::spawn(hwnd, settings.plugins),
             meter: Meter::new(),
             bars: Bars::default(),
             bars_at: None,
@@ -467,6 +493,8 @@ pub fn run() -> Result<()> {
             drop_hover: false,
             drop_glow: Spring::new(0.0),
             shelf_arrival: None,
+            shelf_departures: Vec::new(),
+            shelf_closing: None,
         };
         // Read ahead so the picker opens with the list already there.
         app.outputs.refresh();
@@ -484,6 +512,11 @@ pub fn run() -> Result<()> {
         with_app(App::relayout).transpose()?;
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         watch_windows();
+        // `notch-woy --settings` opens Settings right away (from a shortcut,
+        // say, or to look at it without going through the tray).
+        if std::env::args().any(|arg| arg == "--settings") {
+            settings_window::open(hwnd);
+        }
         // After showing: it hides the notch again if an app is full screen.
         with_app(App::update_obstruction);
 
@@ -493,9 +526,12 @@ pub fn run() -> Result<()> {
         schedule_clock(hwnd);
 
         let mut msg = MSG::default();
+        // Refreshes since the last ambient frame.
+        let mut since_ambient = 0;
         loop {
-            let notch = with_app(|app| app.is_animating()).unwrap_or(false);
-            if notch || settings_window::is_animating() {
+            let (notch, ambient) = with_app(|app| (app.is_animating(), app.ambient().then_some(app.ambient_every)))
+                .unwrap_or((false, None));
+            if notch || ambient.is_some() || settings_window::is_animating() {
                 while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                     if msg.message == WM_QUIT {
                         return Ok(());
@@ -503,8 +539,16 @@ pub fn run() -> Result<()> {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
-                if notch && let Some(Err(e)) = with_app(App::tick) {
-                    eprintln!("frame failed: {e}");
+                since_ambient += 1;
+                let ambient_due = ambient.is_some_and(|every| since_ambient >= every);
+                if notch || ambient_due {
+                    since_ambient = 0;
+                    // Ambient frames only redraw: nothing springs, and the
+                    // notch counts as at rest (it still trims its memory).
+                    let frame = if notch { with_app(App::tick) } else { with_app(App::redraw) };
+                    if let Some(Err(e)) = frame {
+                        eprintln!("frame failed: {e}");
+                    }
                 }
                 settings_window::frame();
                 // Paces frames to the compositor's vsync.
@@ -521,12 +565,29 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// Where `page` sits in `settings`' order, as a `page` value: -100, 0, 100.
+fn page_slot(settings: Settings, page: Page) -> f32 {
+    render::slot_of(settings.page_order, page) * 100.0
+}
+
+/// Every how many display refreshes ambient animations draw, for the
+/// primary display's refresh rate (from the compositor).
+fn ambient_every() -> u32 {
+    let mut timing = DWM_TIMING_INFO { cbSize: size_of::<DWM_TIMING_INFO>() as u32, ..Default::default() };
+    let hz = unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut timing) }
+        .ok()
+        .filter(|()| timing.rateRefresh.uiDenominator != 0)
+        .map_or(60.0, |()| timing.rateRefresh.uiNumerator as f32 / timing.rateRefresh.uiDenominator as f32);
+    (hz / AMBIENT_FPS).round().max(1.0) as u32
+}
+
 /// Hands the pages the app is not using back to Windows, so its memory in
 /// Task Manager is what idle really touches. Start-up (WinRT, device and
 /// audio set-up) leaves several MB behind that the notch never reads again;
 /// pages it does need come back as soft faults (no disk read), which costs
 /// microseconds the next time the notch moves.
 pub fn trim_working_set() {
+    render::release_scratch();
     unsafe {
         let _ = EmptyWorkingSet(GetCurrentProcess());
     }
@@ -675,6 +736,15 @@ mod tests {
     }
 
     #[test]
+    fn ambient_frames_follow_the_display() {
+        // About 60 fps whatever the refresh rate: every refresh at 60 Hz,
+        // every third at 180 Hz.
+        let every = ambient_every();
+        println!("ambient frames every {every} refreshes");
+        assert!((1..=5).contains(&every), "{every}");
+    }
+
+    #[test]
     fn clock_is_hours_and_minutes() {
         // Windows' own short time format, without seconds or AM/PM: "9:41",
         // "09:41" or "21:41", whatever the user's settings.
@@ -765,6 +835,8 @@ impl App {
             // dropped files fall into place.
             || self.drop_hover
             || self.shelf_arrival.is_some()
+            || !self.shelf_departures.is_empty()
+            || self.shelf_closing.is_some()
             || ![
                 self.width,
                 self.height,
@@ -782,6 +854,7 @@ impl App {
                 self.output_hover_alpha,
                 self.shelf_scroll,
                 self.drop_glow,
+                self.displays_reveal,
             ]
             .iter()
             .chain(&self.toggle_on)
@@ -839,10 +912,10 @@ impl App {
         self.hovered = hovered;
         self.retarget();
         if !hovered {
-            // It opens on the player next time, as the island does; unless
-            // files are being dragged onto it.
+            // It opens on the start page (the Layout setting) next time;
+            // unless files are being dragged onto it.
             if !self.drop_hover {
-                self.page = Spring::smooth(0.0);
+                self.page = Spring::smooth(self.slot(self.settings.start_page));
             }
             self.page_drag = None;
             self.shelf_hover = None;
@@ -851,6 +924,9 @@ impl App {
             self.output_reveal = Spring::new(0.0);
             self.output_hover_alpha = Spring::smooth(0.0);
             self.output_pressed = None;
+            self.displays_open = false;
+            self.displays_reveal = Spring::new(0.0);
+            self.display_drag = None;
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), PICKER_CLOSE_TIMER);
             }
@@ -875,8 +951,9 @@ impl App {
             // instead of scrolling through everything sung meanwhile.
             self.update_lyric_line(true);
             self.rearm_mouse_leave();
-            self.progress_interval = 0;
-            self.arm_progress_timer();
+            unsafe {
+                SetTimer(Some(self.hwnd), PROGRESS_TIMER, PROGRESS_INTERVAL_MS, None);
+            }
         } else {
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), PROGRESS_TIMER);
@@ -938,7 +1015,20 @@ impl App {
 
     /// Takes new tray menu choices into effect.
     fn apply_settings(&mut self, next: Settings) -> Result<()> {
+        // The page on screen, to keep it there if the order changes.
+        let showing = self.settings.page_order.iter().copied().min_by(|&a, &b| {
+            let at = |p| (self.page.target - self.slot(p)).abs();
+            at(a).total_cmp(&at(b))
+        });
         let before = std::mem::replace(&mut self.settings, next);
+        if next.page_order != before.page_order || next.start_page != before.start_page {
+            self.page_drag = None;
+            let target = match showing.filter(|_| self.hovered || self.drop_hover) {
+                Some(page) => self.slot(page),
+                None => self.slot(next.start_page),
+            };
+            self.page = Spring::smooth(target);
+        }
         let volume_alerts = next.alert_enabled(AlertKind::Volume);
         if volume_alerts != before.alert_enabled(AlertKind::Volume) {
             // Without the notch's alert, the keys go back to Windows and its
@@ -966,6 +1056,14 @@ impl App {
         if next.width != before.width {
             // The area that counts as under the notch changes with it.
             self.update_obstruction();
+        }
+        if next.plugins != before.plugins {
+            self.plugins.set_enabled(next.plugins);
+        }
+        if next.open_size != before.open_size {
+            // Shelf thumbnails are made at the size they show.
+            let scale = self.open_scale();
+            self.shelf.set_scale(scale);
         }
         self.retarget();
         self.invalidate()
@@ -998,6 +1096,27 @@ impl App {
         self.invalidate()
     }
 
+    /// A plugin's title changed: shown like a notification, under the
+    /// plugin's name; a click opens its link.
+    fn on_plugin(&mut self) -> Result<()> {
+        let Some(update) = self.plugins.take().pop() else { return Ok(()) };
+        if !self.settings.plugins {
+            return Ok(());
+        }
+        let toast = Toast {
+            app: update.name,
+            title: update.output.title,
+            body: update.output.body,
+            icon: None,
+            icon_is_tile: false,
+            app_id: String::new(),
+            tint: None,
+            link: update.output.href,
+        };
+        self.show_alert(Alert::Toast(std::sync::Arc::new(toast)), TOAST_ALERT_MS);
+        self.invalidate()
+    }
+
     fn showing_toast(&self) -> bool {
         matches!(self.alert, Some((Alert::Toast(_), false)))
     }
@@ -1013,7 +1132,8 @@ impl App {
         let target = if let Some(alert) = showing_alert.filter(|_| self.showing_toast()) {
             render::alert_shape(alert, rest.width)
         } else if self.hovered || self.drop_hover {
-            Shape { width: self.open_width(), ..EXPANDED }
+            let zoom = self.settings.open_size.zoom();
+            Shape { width: self.open_width() * zoom, height: EXPANDED.height * zoom, radius: EXPANDED.radius * zoom }
         } else if let Some(alert) = showing_alert {
             render::alert_shape(alert, rest.width)
         } else if self.obstructed {
@@ -1026,9 +1146,21 @@ impl App {
         self.radius.target = target.radius;
     }
 
-    /// The open notch's width for the page it is on or heading to.
+    /// Physical px per unit of the open notch's layout: the display scale
+    /// times the Open size setting's. Hit tests on the open notch use it.
+    fn open_scale(&self) -> f32 {
+        self.scale * self.settings.open_size.zoom()
+    }
+
+    /// Whether the notch has (nearly) finished opening.
+    fn is_open(&self) -> bool {
+        self.height.value >= EXPANDED.height * self.settings.open_size.zoom() * 0.9
+    }
+
+    /// The open notch's width for the page it is on or heading to, in its
+    /// layout's units (before the Open size setting's scale).
     fn open_width(&self) -> f32 {
-        render::open_width(self.panel_width.target, self.page.target / 100.0, self.shelf.len())
+        render::open_width(self.settings.page_order, self.panel_width.target, self.page.target / 100.0, self.shelf.len())
     }
 
     /// Re-reads the battery; a change worth it (plugged in, low...) starts
@@ -1146,6 +1278,12 @@ impl App {
         self.output_hover_alpha.update(dt);
         self.shelf_scroll.update(dt);
         self.drop_glow.update(dt);
+        self.displays_reveal.update(dt);
+        let throw = render::shelf_throw_length();
+        self.shelf_departures.retain(|&(at, _, _)| Instant::now() < at || at.elapsed().as_secs_f32() < throw);
+        if self.shelf_closing.is_some_and(|(at, _)| at.elapsed().as_secs_f32() >= render::shelf_close_length()) {
+            self.shelf_closing = None;
+        }
         if let Some((at, count, _)) = self.shelf_arrival
             && at.elapsed().as_secs_f32() >= render::shelf_arrival_length(count)
         {
@@ -1194,6 +1332,17 @@ impl App {
 
     fn redraw(&mut self) -> Result<()> {
         let levels = self.equalizer_levels();
+        let now = Instant::now();
+        let departures: Vec<Departure> = self
+            .shelf_departures
+            .iter()
+            .map(|(at, icon, from)| Departure {
+                icon: icon.clone(),
+                from: *from,
+                // Negative while it waits its turn.
+                t: if now >= *at { (now - *at).as_secs_f32() } else { -(*at - now).as_secs_f32() },
+            })
+            .collect();
         let shape = Shape {
             width: self.width.value,
             height: self.height.value,
@@ -1233,6 +1382,9 @@ impl App {
             media: self.now_playing.as_ref(),
             toggle_on: self.toggle_on.map(|s| s.value / 100.0),
             toggle_scale: self.toggle_press.map(|s| s.value / 100.0),
+            displays: &self.displays,
+            displays_reveal: self.displays_reveal.value / 100.0,
+            display_drag: self.display_drag,
         };
         let scene = Scene {
             shape,
@@ -1257,6 +1409,8 @@ impl App {
             controls,
             clock: self.started.elapsed().as_secs_f32(),
             levels,
+            open_zoom: self.settings.open_size.zoom(),
+            page_order: self.settings.page_order,
             time: &self.time,
             outputs: OutputsView {
                 list: &self.output_list,
@@ -1274,6 +1428,8 @@ impl App {
                 pressed: self.shelf_pressed.map(|(hit, _)| hit),
                 drop_glow: self.drop_glow.value / 100.0,
                 arrival: self.shelf_arrival.map(|(at, count, from)| Arrival { count, t: at.elapsed().as_secs_f32(), from }),
+                departures: &departures,
+                closing: self.shelf_closing.map(|(at, index)| (index, at.elapsed().as_secs_f32())),
             },
         };
         render::draw(&mut self.pixmap, self.scale, &scene, self.fonts.as_ref());
@@ -1307,7 +1463,7 @@ impl App {
                 self.shadow.insert((pixmap, Surface::new(w as i32, h as i32)?))
             }
         };
-        render::draw_shadow(pixmap, self.scale, shape);
+        render::draw_shadow(pixmap, self.scale, shape, self.settings.open_size.zoom());
         surface.present(self.shadow_hwnd, pixmap, origin)?;
         if !showing {
             unsafe {
@@ -1336,13 +1492,6 @@ impl App {
             return;
         }
         self.equalizer_ticking = showing;
-        unsafe {
-            if showing {
-                SetTimer(Some(self.hwnd), EQUALIZER_TIMER, EQUALIZER_INTERVAL_MS, None);
-            } else {
-                let _ = KillTimer(Some(self.hwnd), EQUALIZER_TIMER);
-            }
-        }
     }
 
     /// Opens the output list over the player, scrolled to show the
@@ -1380,7 +1529,7 @@ impl App {
         }
         render::output_at(
             self.pixmap.width(),
-            self.scale,
+            self.open_scale(),
             self.panel_width.value,
             self.output_scroll.value,
             self.output_list.len(),
@@ -1423,11 +1572,16 @@ impl App {
 
     /// Whether the open notch is showing (or turning to) the Control Center.
     fn on_controls_page(&self) -> bool {
-        self.hovered && self.page.target > 50.0
+        self.hovered && (self.page.target - self.slot(Page::Controls)).abs() < 50.0
+    }
+
+    /// Where `page` sits, as a `page` value: -100, 0 or 100.
+    fn slot(&self, page: Page) -> f32 {
+        page_slot(self.settings, page)
     }
 
     fn scrollable(&self) -> bool {
-        self.hovered && self.height.value >= EXPANDED.height * 0.9 && !self.showing_toast()
+        self.hovered && self.is_open() && !self.showing_toast()
     }
 
     /// Mouse wheel or touchpad scroll up (`delta` > 0) or down. Scrolls the
@@ -1439,6 +1593,9 @@ impl App {
             return Ok(());
         }
         self.start_animation();
+        if self.displays_open {
+            return Ok(());
+        }
         if self.output_picker && !self.on_controls_page() {
             let max = self.output_list.len().saturating_sub(OUTPUT_ROWS_SHOWN) as f32;
             // A wheel notch is a row; a touchpad scrolls smoothly.
@@ -1463,7 +1620,9 @@ impl App {
     /// the pages follow.
     fn on_sideways_wheel(&mut self, delta: i32) {
         // The output picker covers the player; it only scrolls up and down.
-        if !self.scrollable() || delta == 0 || (self.output_picker && !self.on_controls_page()) {
+        // The Displays sheet holds the Control Center in place.
+        let sheet = (self.output_picker && !self.on_controls_page()) || self.displays_open;
+        if !self.scrollable() || delta == 0 || sheet {
             return;
         }
         self.start_animation();
@@ -1505,20 +1664,24 @@ impl App {
 
     fn settle_page(&mut self, target: f32) {
         self.page.target = target;
+        let controls = (target - self.slot(Page::Controls)).abs() < 50.0;
+        if !controls {
+            self.close_displays();
+        }
         self.retarget();
-        if target > 50.0 {
+        if controls {
             // Radios may have been switched elsewhere since last looked.
             self.controls.send(ControlCommand::Refresh);
         }
     }
 
     fn on_shelf_page(&self) -> bool {
-        (self.hovered || self.drop_hover) && self.page.target < -50.0
+        (self.hovered || self.drop_hover) && (self.page.target - self.slot(Page::Shelf)).abs() < 50.0
     }
 
     fn shelf_hit(&self, x: f32, y: f32) -> Option<ShelfHit> {
         let (count, scroll) = (self.shelf.len(), self.shelf_scroll.value);
-        render::shelf_at(self.pixmap.width(), self.scale, count, scroll, (x, y))
+        render::shelf_at(self.pixmap.width(), self.open_scale(), count, scroll, (x, y))
     }
 
     /// Files dragged over the notch (`true`) or away (`false`): it opens
@@ -1534,14 +1697,15 @@ impl App {
         if files {
             self.close_output_picker();
             self.page_drag = None;
+            let shelf = self.slot(Page::Shelf);
             if self.hovered {
-                self.page.target = -100.0;
+                self.page.target = shelf;
             } else {
-                // Straight onto the shelf as it grows, not via the player.
-                self.page = Spring::smooth(-100.0);
+                // Straight onto the shelf as it grows, not via another page.
+                self.page = Spring::smooth(shelf);
             }
         } else if !self.hovered {
-            self.page = Spring::smooth(0.0);
+            self.page = Spring::smooth(self.slot(self.settings.start_page));
         }
         self.retarget();
         let _ = self.invalidate();
@@ -1562,18 +1726,19 @@ impl App {
         }
         // The pointer is on the notch: it stays open on the shelf.
         self.set_hovered(true);
-        self.page.target = -100.0;
+        self.page.target = self.slot(Page::Shelf);
         self.retarget();
         let _ = self.invalidate();
     }
 
-    /// The pointer in logical canvas px.
+    /// The pointer in the open notch's layout units.
     fn pointer(&self) -> (f32, f32) {
         let mut pt = POINT::default();
         unsafe {
             let _ = GetCursorPos(&mut pt);
         }
-        ((pt.x - self.origin.x) as f32 / self.scale, (pt.y - self.origin.y) as f32 / self.scale)
+        let scale = self.open_scale();
+        ((pt.x - self.origin.x) as f32 / scale, (pt.y - self.origin.y) as f32 / scale)
     }
 
     fn on_shelf_down(&mut self, x: f32, y: f32) -> Result<()> {
@@ -1608,6 +1773,16 @@ impl App {
             match pressed {
                 ShelfHit::Item(index) => self.shelf.open(index),
                 ShelfHit::Remove(index) => {
+                    // Its icon is thrown into the bin; the tiles after it
+                    // close the gap.
+                    self.start_animation();
+                    let now = Instant::now();
+                    if let Some(from) = self.shelf_icon_center(index) {
+                        let icon = self.shelf.items().get(index).and_then(|item| item.icon.clone());
+                        self.shelf_departures.push((now, icon, from));
+                    }
+                    self.shelf_closing = Some((now, index));
+                    self.shelf_arrival = None;
                     self.shelf.remove(index);
                     self.shelf_hover = None;
                     self.clamp_shelf_scroll();
@@ -1617,13 +1792,27 @@ impl App {
                     // The share sheet hangs below the notch's top center.
                     let anchor = POINT {
                         x: self.origin.x + self.pixmap.width() as i32 / 2,
-                        y: self.origin.y + (EXPANDED.height * self.scale) as i32,
+                        y: self.origin.y + (EXPANDED.height * self.open_scale()) as i32,
                     };
                     if let Err(e) = self.shelf.share(anchor) {
                         eprintln!("share failed: {e}");
                     }
                 }
                 ShelfHit::Clear => {
+                    // Every file in sight is thrown into the bin, one after
+                    // the other, left to right.
+                    self.start_animation();
+                    let now = Instant::now();
+                    let mut turn = 0;
+                    for index in 0..self.shelf.len() {
+                        let Some(from) = self.shelf_icon_center(index) else { continue };
+                        let icon = self.shelf.items()[index].icon.clone();
+                        let at = now + Duration::from_secs_f32(render::THROW_STAGGER * turn as f32);
+                        self.shelf_departures.push((at, icon, from));
+                        turn += 1;
+                    }
+                    self.shelf_closing = None;
+                    self.shelf_arrival = None;
                     self.shelf.clear();
                     self.shelf_hover = None;
                     self.shelf_scroll = Spring::smooth(0.0);
@@ -1662,8 +1851,15 @@ impl App {
         self.shelf_scroll.target = (self.shelf_scroll.target + delta as f32 / 120.0).clamp(0.0, max);
     }
 
+    /// Where the icon of the file at `index` is on the shelf page, if in
+    /// sight.
+    fn shelf_icon_center(&self, index: usize) -> Option<(f32, f32)> {
+        let (count, scroll) = (self.shelf.len(), self.shelf_scroll.value);
+        render::shelf_icon_center(self.pixmap.width(), self.open_scale(), count, scroll, index)
+    }
+
     fn shelf_max_scroll(&self) -> f32 {
-        render::shelf_max_scroll(self.pixmap.width(), self.scale, self.shelf.len())
+        render::shelf_max_scroll(self.pixmap.width(), self.open_scale(), self.shelf.len())
     }
 
     fn clamp_shelf_scroll(&mut self) {
@@ -1676,7 +1872,59 @@ impl App {
 
     fn on_controls(&mut self) -> Result<()> {
         self.control_state = self.controls.state();
+        self.displays = self.controls.displays();
+        if self.displays.len() < 2 {
+            // A monitor unplugged: nothing left to set apart.
+            self.close_displays();
+        }
         self.sync_toggles();
+        self.invalidate()
+    }
+
+    /// Opens the Displays sheet: each screen's brightness on its own slider.
+    fn open_displays(&mut self) {
+        self.start_animation();
+        self.displays_open = true;
+        self.displays_reveal.target = 100.0;
+        // Levels may have changed from the monitors' own buttons.
+        self.controls.send(ControlCommand::Refresh);
+    }
+
+    fn close_displays(&mut self) {
+        if self.displays_open {
+            self.start_animation();
+            self.displays_open = false;
+            self.displays_reveal.target = 0.0;
+        }
+        self.display_drag = None;
+    }
+
+    /// Sets one screen's brightness from its slider in the Displays sheet.
+    fn apply_display(&mut self, display: usize, value: f32) {
+        self.display_drag = Some((display, value));
+        self.controls.send(ControlCommand::SetDisplayBrightness(display, (value * 100.0).round() as u8));
+    }
+
+    fn on_display_move(&mut self, x: f32) -> Result<()> {
+        if let Some((display, _)) = self.display_drag {
+            let value = render::display_value(self.pixmap.width(), self.open_scale(), self.displays.len(), x);
+            self.apply_display(display, value);
+        }
+        self.invalidate()
+    }
+
+    fn finish_display_drag(&mut self) -> Result<()> {
+        // Cleared before releasing, so the capture change is not a cancel.
+        if let Some((display, value)) = self.display_drag.take()
+            && let Some(level) = self.displays.get_mut(display)
+        {
+            // Shows what was set until the worker reports back.
+            level.percent = Some((value * 100.0).round() as u8);
+        }
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        self.rearm_mouse_leave();
         self.invalidate()
     }
 
@@ -1754,22 +2002,17 @@ impl App {
         self.invalidate()
     }
 
-    /// Sets the open notch's tick to what it shows: faster while synced
-    /// lyrics are lighting up as they are sung.
-    fn arm_progress_timer(&mut self) {
+    /// Whether something keeps moving with nothing else animating: the
+    /// resting notch's equalizer, or the sung lyric lighting up. Drawn by the
+    /// frame loop every `ambient_every` refreshes.
+    fn ambient(&self) -> bool {
         let playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
         let synced = matches!(&self.lyrics_state, LyricsState::Found(l) if l.synced);
-        let interval = if self.lyrics_open && synced && playing { LYRICS_INTERVAL_MS } else { PROGRESS_INTERVAL_MS };
-        if interval != self.progress_interval {
-            self.progress_interval = interval;
-            unsafe {
-                SetTimer(Some(self.hwnd), PROGRESS_TIMER, interval, None);
-            }
-        }
+        let karaoke = playing && synced && self.hovered && self.lyrics_open && self.is_open() && self.page.target == self.slot(Page::Player);
+        self.equalizer_ticking || karaoke
     }
 
     fn on_timer(&mut self) -> Result<()> {
-        self.arm_progress_timer();
         self.update_lyric_line(false);
         let playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
         if playing { self.invalidate() } else { Ok(()) }
@@ -1849,23 +2092,23 @@ impl App {
     /// Where along the progress bar `pos` falls; see `render::progress_at`.
     fn progress_at(&self, pos: (f32, f32), grab: bool) -> Option<f32> {
         let reveal = self.lyrics_reveal.value / 100.0;
-        render::progress_at(self.pixmap.width(), self.scale, self.panel_width.value, reveal, pos, grab)
+        render::progress_at(self.pixmap.width(), self.open_scale(), self.panel_width.value, reveal, pos, grab)
     }
 
     /// Whether the open notch is showing a track that can be acted on.
     fn controls_ready(&self) -> bool {
         // Controls only respond once the notch is (nearly) fully open.
-        self.now_playing.is_some() && self.height.value >= EXPANDED.height * 0.9
+        self.now_playing.is_some() && self.is_open()
     }
 
     /// Where a press on the Control Center page lands, once it is in view.
     fn control_at(&self, x: f32, y: f32) -> Option<ControlHit> {
-        let settled = self.on_controls_page() && self.page.value > 90.0;
-        let open = self.height.value >= EXPANDED.height * 0.9;
+        let settled = self.on_controls_page() && (self.page.value - self.slot(Page::Controls)).abs() < 10.0;
+        let open = self.is_open();
         if !settled || !open {
             return None;
         }
-        render::control_at(self.pixmap.width(), self.scale, (x, y))
+        render::control_at(self.pixmap.width(), self.open_scale(), self.displays.len() > 1, (x, y))
     }
 
     /// Starts dragging a Control Center slider or the progress knob if the
@@ -1879,7 +2122,25 @@ impl App {
             return self.invalidate();
         }
         if self.on_controls_page() {
+            // The Displays sheet takes presses while open: its sliders, and
+            // anywhere off it closes it.
+            if self.displays_open {
+                let count = self.displays.len();
+                match render::display_at(self.pixmap.width(), self.open_scale(), count, (x, y)) {
+                    Some(render::DisplayHit::Slider(display, value)) => {
+                        self.apply_display(display, value);
+                        unsafe { SetCapture(self.hwnd) };
+                    }
+                    Some(render::DisplayHit::Sheet) => {}
+                    None => self.close_displays(),
+                }
+                return self.invalidate();
+            }
             match self.control_at(x, y) {
+                Some(ControlHit::Displays) => {
+                    self.open_displays();
+                    return self.invalidate();
+                }
                 Some(ControlHit::Slider(slider, value)) => {
                     self.apply_slider(slider, value);
                     // Keep receiving moves and the release even off the notch.
@@ -1915,7 +2176,7 @@ impl App {
 
     fn on_slider_move(&mut self, y: f32) -> Result<()> {
         if let Some((slider, _)) = self.slider_drag {
-            self.apply_slider(slider, render::slider_value(self.scale, y));
+            self.apply_slider(slider, render::slider_value(self.open_scale(), y));
         }
         self.invalidate()
     }
@@ -1964,7 +2225,7 @@ impl App {
         }
         let index = render::lyric_at(
             self.pixmap.width(),
-            self.scale,
+            self.open_scale(),
             self.panel_width.value,
             self.lyrics_reveal.value / 100.0,
             self.lyric_scroll.value,
@@ -2001,9 +2262,20 @@ impl App {
         }
         if self.on_controls_page() {
             self.release_toggles();
+            // The Displays sheet handled the press (or it closed the sheet:
+            // that click is not for what lies under it).
+            if self.displays_open || self.displays_reveal.value > 1.0 {
+                return self.invalidate();
+            }
             match self.control_at(x, y) {
                 Some(ControlHit::Toggle(toggle)) => self.toggle(toggle),
                 Some(ControlHit::PlayPause) => self.toggle_play_pause(),
+                // The Now Playing module opens the player, as on an iPhone.
+                Some(ControlHit::NowPlaying) if self.now_playing.is_some() => {
+                    self.start_animation();
+                    let player = self.slot(Page::Player);
+                    self.settle_page(player);
+                }
                 _ => {}
             }
             return self.invalidate();
@@ -2044,7 +2316,7 @@ impl App {
         }
         let button = render::button_at(
             self.pixmap.width(),
-            self.scale,
+            self.open_scale(),
             self.panel_width.value,
             self.lyrics_reveal.value / 100.0,
             x,
@@ -2097,7 +2369,8 @@ impl App {
             self.hide_shadow();
             self.shadow_shape = None;
 
-            self.shelf.set_scale(self.scale);
+            let scale = self.open_scale();
+            self.shelf.set_scale(scale);
             let mon = info.rcMonitor;
             self.monitor = mon;
             self.origin = POINT {
@@ -2142,6 +2415,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             if let Some(Err(e)) = with_app(App::relayout) {
                 eprintln!("relayout failed: {e}");
             }
+            // The refresh rate may have changed with the display mode.
+            with_app(|app| app.ambient_every = ambient_every());
             // The monitor's bounds changed (resolution or scale settling at
             // login): what fills or covers it must be judged again.
             with_app(App::update_obstruction);
@@ -2168,6 +2443,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     app.on_seek_move(x, y)
                 } else if app.slider_drag.is_some() {
                     app.on_slider_move(y)
+                } else if app.display_drag.is_some() {
+                    app.on_display_move(x)
                 } else if app.shelf_pressed.is_some() {
                     Ok(())
                 } else {
@@ -2207,6 +2484,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     app.finish_seek()
                 } else if app.slider_drag.is_some() {
                     app.finish_slider()
+                } else if app.display_drag.is_some() {
+                    app.finish_display_drag()
                 } else {
                     app.on_click(x, y)
                 }
@@ -2224,7 +2503,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if app.shelf_pressed.take().is_some() {
                     return app.invalidate();
                 }
-                let slider = app.slider_drag.take().is_some();
+                let slider = app.slider_drag.take().is_some() | app.display_drag.take().is_some();
                 if app.seeking.take().is_some() || slider {
                     app.start_animation();
                     app.seek_grow.target = 0.0;
@@ -2243,6 +2522,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             // High word of wparam: signed sideways travel, positive to the right.
             let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as i32;
             with_app(|app| app.on_sideways_wheel(delta));
+            LRESULT(0)
+        }
+        WM_PLUGIN => {
+            if let Some(Err(e)) = with_app(App::on_plugin) {
+                eprintln!("plugin alert failed: {e}");
+            }
             LRESULT(0)
         }
         WM_SHELF => {
@@ -2309,14 +2594,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_OUTPUTS => {
             if let Some(Err(e)) = with_app(App::on_outputs) {
                 eprintln!("outputs redraw failed: {e}");
-            }
-            LRESULT(0)
-        }
-        WM_TIMER if wparam.0 == EQUALIZER_TIMER => {
-            // The animation loop already redraws every frame.
-            let result = with_app(|app| if app.is_animating() { Ok(()) } else { app.redraw() });
-            if let Some(Err(e)) = result {
-                eprintln!("equalizer redraw failed: {e}");
             }
             LRESULT(0)
         }

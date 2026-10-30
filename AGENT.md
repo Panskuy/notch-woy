@@ -45,7 +45,8 @@ target/, dist/    output build, di-.gitignore
 | `notifications.rs` | Poll toast di notification center (`UserNotificationListener`) tiap 0.7 s; klik membuka aplikasi pengirim. |
 | `controls.rs` | Control Center: radio Wi-Fi/Bluetooth, airplane mode, brightness (WMI untuk layar internal, DDC/CI untuk monitor eksternal) di worker thread. |
 | `tray.rs` | Ikon tray + menu (Settings…, Start at login, Exit); ditambah ulang saat Explorer restart. |
-| `settings.rs` | Pengaturan pengguna (alert per jenis, durasi alert, lebar notch Narrow/Normal/Wide/Wider, jeda Bluetooth) sebagai DWORD di `HKCU\Software\notch-woy`; nilai hilang/tidak valid kembali ke default. Nilai enum yang disimpan = discriminant-nya (jangan diubah; tambah varian baru di nomor berikutnya). `to_bits`/`from_bits` untuk mengirim lewat `wparam`. |
+| `settings.rs` | Pengaturan pengguna (alert per jenis, durasi alert, lebar notch Narrow/Normal/Wide/Wider, ukuran notch terbuka Compact/Normal/Large `OpenSize`, jeda Bluetooth) sebagai DWORD di `HKCU\Software\notch-woy`; nilai hilang/tidak valid kembali ke default. Nilai enum yang disimpan = discriminant-nya (jangan diubah; tambah varian baru di nomor berikutnya). `to_bits`/`from_bits` untuk mengirim lewat `wparam`. |
+| `plugins.rs` | Plugin gaya xbar/SwiftBar: file `{nama}.{interval}.{ext}` (`.ps1`, `.cmd`/`.bat`, `.py`, `.exe`) di `%LOCALAPPDATA%\notch-woy\plugins`, dijalankan sebagai proses tanpa jendela di thread worker (batas 10 s, interval min 5 s) hanya bila `Settings::plugins` (default mati). Baris pertama sebelum `---` = judul (`\| href=`), baris pertama sesudahnya = isi; judul berubah → `WM_PLUGIN` → alert `Toast` dengan `link`. |
 | `shelf.rs` | File shelf: daftar path (bukan salinan) di `%LOCALAPPDATA%\notch-woy\shelf.txt`, worker thumbnail (`IShellItemImageFactory`), drop target OLE (`IDropTarget`, hanya Copy/Link, tidak pernah Move), seret keluar (`SHDoDragDrop`, harus dipanggil tanpa borrow `App`), share (`DataTransferManager` lewat jendela jangkar 1x1 tak terlihat: share sheet menolak jendela `NOACTIVATE` seperti notch). |
 | `settings_ui.rs` | Tampilan jendela pengaturan ala macOS System Settings, digambar sendiri dengan tiny-skia: layout (logis 700×420), gambar (`draw`), hit-test (`hit`, `control_rect`), urutan fokus. Fungsi murni; pratinjau PNG lewat test `settings_preview`. Memakai `render::Fonts` dan `render::draw` (pratinjau notch). |
 | `settings_window.rs` | Host Win32 untuk `settings_ui`: jendela, `WM_PAINT` via `SetDIBitsToDevice`, mouse/keyboard, animasi `Spring` dengan timer 16 ms, tema terang/gelap + title bar DWM, DPI. Perubahan langsung disimpan dan dikirim ke notch via `WM_SETTINGS_CHANGED`. Langkah yang punya modal loop sendiri (menu pop-up, konfirmasi reset) dan penutupan jendela dijalankan setelah borrow state dilepas (`Modal`). |
@@ -73,10 +74,15 @@ target/, dist/    output build, di-.gitignore
   | `WM_OUTPUTS` | `WM_APP + 10` | outputs.rs |
   | `WM_SETTINGS_CHANGED` | `WM_APP + 11` | settings_window.rs (`wparam` = `Settings::to_bits`) |
   | `WM_SHELF` | `WM_APP + 12` | shelf.rs (ikon file siap) |
+  | `WM_PLUGIN` | `WM_APP + 13` | plugins.rs (judul plugin berubah) |
 
-  Nomor baru harus unik; `WM_APP + 13` adalah yang berikutnya yang bebas.
-- **Halaman notch terbuka**: berdampingan kiri-kanan, `App::page` -100 (shelf,
-  kiri), 0 (player), 100 (Control Center, kanan); digeser sejauh lebar notch
+  Nomor baru harus unik; `WM_APP + 14` adalah yang berikutnya yang bebas.
+- **Halaman notch terbuka**: berdampingan kiri-kanan, `App::page` -100
+  (slot kiri), 0 (tengah), 100 (kanan). Halaman mana di slot mana:
+  `Settings::page_order` (default shelf, player, Control Center; diatur di
+  Settings → Layout), halaman pembuka `Settings::start_page`. Jangan
+  menganggap shelf = -100 dsb.: pakai `App::slot(Page)` / `render::slot_of`;
+  lebar per slot `render::open_width(order, ...)`. Digeser sejauh lebar notch
   (`Canvas::dx`). `WM_MOUSEHWHEEL` (positif = kanan) dan `WM_MOUSEWHEEL`
   (turun = kanan; di shelf menggulir file dulu) lewat `turn_pages`;
   `rubber_band` dan `page_after_drag` untuk touchpad. Titik halaman di bawah.
@@ -85,15 +91,26 @@ target/, dist/    output build, di-.gitignore
   Lebar notch terbuka per halaman: `render::open_width` (shelf
   `shelf_width(count)` 400–520, player `panel_width`, Control Center
   `CONTROLS_WIDTH` 560); `App::retarget` dipanggil saat halaman atau jumlah
-  file shelf berubah. Kanvas 600 logis membatasi lebar maksimum.
+  file shelf berubah. Kanvas jendela 660 logis (`WIN_W`) membatasi lebar
+  maksimum: Control Center 560 x Large 1,1 + bahu + pantulan pegas.
+- **Open size** (`Settings::open_size`, `OpenSize::zoom` 0,9/1/1,1): notch
+  terbuka diskalakan utuh. Bentuk target dikali zoom (`App::retarget`),
+  isi ditata dalam satuan desain dan digambar dengan `scale * zoom`
+  (`Scene::open_zoom`); semua hit-test notch terbuka memakai
+  `App::open_scale()`, pengecekan "sudah terbuka" memakai `App::is_open()`.
   Klik di halaman shelf tidak diteruskan ke hit-test player.
 - **Pacing animasi**: message loop di `window::run` berjalan per frame
   (`DwmFlush`, ikut vsync) selama notch *atau* jendela pengaturan
-  beranimasi (`settings_window::is_animating` / `frame`). Jangan pakai
-  `SetTimer` untuk animasi: timer 16 ms terukur jalan tiap 8–38 ms.
+  beranimasi (`settings_window::is_animating` / `frame`). Animasi yang bisa
+  berjalan lama (equalizer notch diam, lirik per kata) juga lewat loop ini
+  (`App::ambient`), tapi hanya tiap `ambient_every` refresh (~60 fps:
+  `round(Hz / 60)` dari `DwmGetCompositionTimingInfo`) dan hanya `redraw`.
+  Jangan pakai `SetTimer` untuk animasi: timer 16 ms terukur jalan tiap
+  8–38 ms. Jangan memanggil hal yang lambat (RPC layanan audio, WMI, I/O)
+  di jalur frame: anggaran di 180 Hz hanya 5,5 ms.
 - **Memori**: `window::trim_working_set` (`EmptyWorkingSet`) dipanggil oleh
   `TRIM_TIMER` (id 8) saat notch diam dan saat jendela pengaturan ditutup.
-  Timer id di `window.rs` yang terpakai: 1–9 (`CLOCK_TIMER` 9: jam notch
+  Timer id di `window.rs` yang terpakai: 1–4, 6–9 (5 bebas; `CLOCK_TIMER` 9: jam notch
   diam, dipasang ulang tiap pergantian menit; juga `WM_TIMECHANGE` dan resume).
 - **Jendela biasa** (bukan notch) ditampilkan dengan `SetWindowPos(SWP_SHOWWINDOW)`,
   bukan `ShowWindow`: panggilan `ShowWindow` pertama di proses memakai show

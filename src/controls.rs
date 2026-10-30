@@ -9,11 +9,16 @@ use std::thread;
 use windows::core::{w, Error, Result, BOOL, BSTR};
 use windows::Devices::Radios::{Radio, RadioKind, RadioState};
 use windows::Win32::Devices::Display::{
-    DestroyPhysicalMonitor, GetMonitorBrightness, GetNumberOfPhysicalMonitorsFromHMONITOR,
-    GetPhysicalMonitorsFromHMONITOR, SetMonitorBrightness, PHYSICAL_MONITOR,
+    DestroyPhysicalMonitor, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, GetMonitorBrightness,
+    GetNumberOfPhysicalMonitorsFromHMONITOR, GetPhysicalMonitorsFromHMONITOR, QueryDisplayConfig, SetMonitorBrightness,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_MODE_INFO,
+    DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, PHYSICAL_MONITOR,
+    QDC_ONLY_ACTIVE_PATHS,
 };
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+};
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Variant::{VARIANT, VT_I4, VT_UI1};
 use windows::Win32::System::Wmi::*;
@@ -59,18 +64,34 @@ impl ControlState {
     }
 }
 
+/// A screen whose brightness can be set, for the Displays sheet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisplayLevel {
+    /// "Built-in Display", or the monitor's own name ("Mi Monitor").
+    pub name: String,
+    /// The laptop's panel (set through WMI) rather than an external
+    /// monitor (DDC/CI).
+    pub internal: bool,
+    /// Percent; `None` if it did not say.
+    pub percent: Option<u8>,
+}
+
 #[derive(Clone, Copy)]
 pub enum ControlCommand {
     Refresh,
     SetWifi(bool),
     SetBluetooth(bool),
     SetAirplane(bool),
+    /// Every screen at once (the Control Center slider).
     SetBrightness(u8),
+    /// One screen, by its index in `Controls::displays`.
+    SetDisplayBrightness(usize, u8),
 }
 
 pub struct Controls {
     commands: Sender<ControlCommand>,
     state: Arc<Mutex<ControlState>>,
+    displays: Arc<Mutex<Vec<DisplayLevel>>>,
 }
 
 impl Controls {
@@ -78,15 +99,16 @@ impl Controls {
     pub fn spawn(hwnd: HWND) -> Self {
         let (commands, rx) = mpsc::channel();
         let state = Arc::new(Mutex::new(ControlState::default()));
-        let shared = state.clone();
+        let displays = Arc::new(Mutex::new(Vec::new()));
+        let (shared, shared_displays) = (state.clone(), displays.clone());
         // HWND is not Send; pass the raw handle value across.
         let raw = hwnd.0 as isize;
         thread::spawn(move || {
-            if let Err(e) = run(raw, rx, shared) {
+            if let Err(e) = run(raw, rx, shared, shared_displays) {
                 eprintln!("controls worker stopped: {e}");
             }
         });
-        let controls = Self { commands, state };
+        let controls = Self { commands, state, displays };
         controls.send(ControlCommand::Refresh);
         controls
     }
@@ -98,25 +120,44 @@ impl Controls {
     pub fn state(&self) -> ControlState {
         *self.state.lock().unwrap()
     }
+
+    /// The screens whose brightness can be set: the laptop's panel first,
+    /// then external monitors, as last read.
+    pub fn displays(&self) -> Vec<DisplayLevel> {
+        self.displays.lock().unwrap().clone()
+    }
 }
 
-fn run(hwnd: isize, rx: Receiver<ControlCommand>, shared: Arc<Mutex<ControlState>>) -> Result<()> {
+fn run(
+    hwnd: isize,
+    rx: Receiver<ControlCommand>,
+    shared: Arc<Mutex<ControlState>>,
+    shared_displays: Arc<Mutex<Vec<DisplayLevel>>>,
+) -> Result<()> {
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
     // Without access the radio list is still readable; switching just fails.
     let _ = Radio::RequestAccessAsync().and_then(|op| op.get());
     let wmi = connect_wmi().ok();
     let mut externals = external_displays();
+    // Whether the laptop panel answers WMI (it is then display 0).
+    let mut has_panel = wmi.as_ref().is_some_and(|wmi| brightness(wmi).is_ok());
 
     while let Ok(first) = rx.recv() {
         // A brightness drag sends a burst; only the latest value matters.
         let mut batch = vec![first];
         batch.extend(rx.try_iter());
         let last_brightness = batch.iter().rposition(|c| matches!(c, ControlCommand::SetBrightness(_)));
-        for (i, command) in batch.into_iter().enumerate() {
+        // And per screen: the latest for each.
+        let last_for = |display: usize| {
+            batch.iter().rposition(|c| matches!(c, ControlCommand::SetDisplayBrightness(d, _) if *d == display))
+        };
+        let latest: Vec<Option<usize>> = (0..=externals.len()).map(last_for).collect();
+        for (i, command) in batch.iter().copied().enumerate() {
             let result = match command {
                 ControlCommand::Refresh => {
                     // Monitors may have been plugged in or out since.
                     externals = external_displays();
+                    has_panel = wmi.as_ref().is_some_and(|wmi| brightness(wmi).is_ok());
                     Ok(())
                 }
                 ControlCommand::SetWifi(on) => set_radio(RadioKind::WiFi, on),
@@ -124,18 +165,37 @@ fn run(hwnd: isize, rx: Receiver<ControlCommand>, shared: Arc<Mutex<ControlState
                 ControlCommand::SetAirplane(on) => {
                     set_radio(RadioKind::WiFi, !on).and(set_radio(RadioKind::Bluetooth, !on))
                 }
-                // One slider for every screen: the laptop panel and any
-                // external monitors.
+                // The Control Center slider: every screen, the laptop panel
+                // and any external monitors.
                 ControlCommand::SetBrightness(percent) if Some(i) == last_brightness => {
-                    for display in &externals {
+                    for display in &mut externals {
                         display.set_percent(percent);
                     }
                     match &wmi {
-                        Some(wmi) => set_brightness(wmi, percent),
-                        None => Ok(()),
+                        Some(wmi) if has_panel => set_brightness(wmi, percent),
+                        _ => Ok(()),
                     }
                 }
                 ControlCommand::SetBrightness(_) => Ok(()),
+                // One screen, from the Displays sheet.
+                ControlCommand::SetDisplayBrightness(display, percent)
+                    if latest.get(display).copied().flatten() == Some(i) =>
+                {
+                    match (has_panel, display) {
+                        (true, 0) => match &wmi {
+                            Some(wmi) => set_brightness(wmi, percent),
+                            None => Ok(()),
+                        },
+                        _ => {
+                            let index = display - usize::from(has_panel);
+                            if let Some(external) = externals.get_mut(index) {
+                                external.set_percent(percent);
+                            }
+                            Ok(())
+                        }
+                    }
+                }
+                ControlCommand::SetDisplayBrightness(..) => Ok(()),
             };
             if let Err(e) = result {
                 eprintln!("control failed: {e}");
@@ -143,13 +203,20 @@ fn run(hwnd: isize, rx: Receiver<ControlCommand>, shared: Arc<Mutex<ControlState
         }
 
         // The slider shows the laptop panel's level, or an external
-        // monitor's on a desktop.
-        let panel = wmi.as_ref().and_then(|wmi| brightness(wmi).ok());
+        // monitor's on a desktop. External levels are the last read or set
+        // (reading over DDC/CI takes tens of ms; not on every drag step).
+        let panel = wmi.as_ref().filter(|_| has_panel).and_then(|wmi| brightness(wmi).ok());
         let state = ControlState {
             wifi: radio_state(RadioKind::WiFi),
             bluetooth: radio_state(RadioKind::Bluetooth),
-            brightness: panel.or_else(|| externals.iter().find_map(ExternalDisplay::percent)),
+            brightness: panel.or_else(|| externals.iter().find_map(|d| d.percent)),
         };
+        let mut displays = Vec::with_capacity(externals.len() + 1);
+        if has_panel {
+            displays.push(DisplayLevel { name: "Built-in Display".into(), internal: true, percent: panel });
+        }
+        displays.extend(externals.iter().map(|d| DisplayLevel { name: d.name.clone(), internal: false, percent: d.percent }));
+        *shared_displays.lock().unwrap() = displays;
         *shared.lock().unwrap() = state;
         unsafe {
             let _ = PostMessageW(Some(HWND(hwnd as _)), WM_CONTROLS, WPARAM(0), LPARAM(0));
@@ -181,21 +248,18 @@ struct ExternalDisplay {
     handle: HANDLE,
     min: u32,
     max: u32,
+    /// The monitor's name, as Windows' display settings show it.
+    name: String,
+    /// Read when found, then what was last set.
+    percent: Option<u8>,
 }
 
 impl ExternalDisplay {
-    fn percent(&self) -> Option<u8> {
-        let (mut min, mut current, mut max) = (0, 0, 0);
-        if unsafe { GetMonitorBrightness(self.handle, &mut min, &mut current, &mut max) } == 0 || max <= min {
-            return None;
-        }
-        Some((((current.clamp(min, max) - min) * 100) / (max - min)) as u8)
-    }
-
-    fn set_percent(&self, percent: u8) {
+    fn set_percent(&mut self, percent: u8) {
         let value = self.min + (self.max - self.min) * percent.min(100) as u32 / 100;
         // Slow (tens of ms) and best effort: the monitor may refuse.
         unsafe { SetMonitorBrightness(self.handle, value) };
+        self.percent = Some(percent.min(100));
     }
 }
 
@@ -217,8 +281,10 @@ fn external_displays() -> Vec<ExternalDisplay> {
         let _ = EnumDisplayMonitors(None, None, Some(collect), LPARAM(&mut monitors as *mut Vec<HMONITOR> as isize));
     }
 
+    let names = monitor_names();
     let mut displays = Vec::new();
     for monitor in monitors {
+        let name = gdi_device(monitor).and_then(|device| names.get(&device).cloned());
         let mut count = 0;
         if unsafe { GetNumberOfPhysicalMonitorsFromHMONITOR(monitor, &mut count) }.is_err() || count == 0 {
             continue;
@@ -231,13 +297,70 @@ fn external_displays() -> Vec<ExternalDisplay> {
             let (mut min, mut current, mut max) = (0, 0, 0);
             let answers = unsafe { GetMonitorBrightness(p.hPhysicalMonitor, &mut min, &mut current, &mut max) } != 0;
             if answers && max > min {
-                displays.push(ExternalDisplay { handle: p.hPhysicalMonitor, min, max });
+                let percent = Some((((current.clamp(min, max) - min) * 100) / (max - min)) as u8);
+                let name = name.clone().unwrap_or_else(|| "External Display".into());
+                displays.push(ExternalDisplay { handle: p.hPhysicalMonitor, min, max, name, percent });
             } else {
                 let _ = unsafe { DestroyPhysicalMonitor(p.hPhysicalMonitor) };
             }
         }
     }
     displays
+}
+
+/// The GDI device name (`\\.\DISPLAY2`) of a monitor.
+fn gdi_device(monitor: HMONITOR) -> Option<String> {
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+    unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo as *mut MONITORINFO).ok().ok()? };
+    Some(String::from_utf16_lossy(&info.szDevice).trim_end_matches('\0').to_owned())
+}
+
+/// Each active monitor's friendly name ("Mi Monitor", "DELL U2720Q"), by
+/// the GDI device name its desktop is on; from the display configuration,
+/// where Settings > Display gets them too.
+fn monitor_names() -> std::collections::HashMap<String, String> {
+    let mut names = std::collections::HashMap::new();
+    let (mut path_count, mut mode_count) = (0u32, 0u32);
+    unsafe {
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count).is_err() {
+            return names;
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        let found = QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut path_count,
+            paths.as_mut_ptr(),
+            &mut mode_count,
+            modes.as_mut_ptr(),
+            None,
+        );
+        if found.is_err() {
+            return names;
+        }
+        for path in &paths[..path_count as usize] {
+            let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+            source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            source.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+            source.header.adapterId = path.sourceInfo.adapterId;
+            source.header.id = path.sourceInfo.id;
+            let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+            target.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+            target.header.size = size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32;
+            target.header.adapterId = path.targetInfo.adapterId;
+            target.header.id = path.targetInfo.id;
+            if DisplayConfigGetDeviceInfo(&mut source.header) != 0 || DisplayConfigGetDeviceInfo(&mut target.header) != 0 {
+                continue;
+            }
+            let device = String::from_utf16_lossy(&source.viewGdiDeviceName).trim_end_matches('\0').to_owned();
+            let name = String::from_utf16_lossy(&target.monitorFriendlyDeviceName).trim_end_matches('\0').to_owned();
+            if !name.is_empty() {
+                names.insert(device, name);
+            }
+        }
+    }
+    names
 }
 
 fn connect_wmi() -> Result<IWbemServices> {
@@ -329,7 +452,7 @@ mod tests {
         let displays = external_displays();
         println!("{} external display(s) with DDC/CI brightness", displays.len());
         for d in &displays {
-            println!("  range {}..{}, now {:?}%", d.min, d.max, d.percent());
+            println!("  {}: range {}..{}, now {:?}%", d.name, d.min, d.max, d.percent);
         }
     }
 
@@ -339,10 +462,10 @@ mod tests {
     #[test]
     #[ignore]
     fn sets_external_brightness() {
-        for d in external_displays() {
-            let current = d.percent().unwrap();
+        for mut d in external_displays() {
+            let current = d.percent.unwrap();
             d.set_percent(current);
-            println!("set external to its current {current}%: now {:?}%", d.percent());
+            println!("set {} to its current {current}%", d.name);
         }
     }
 

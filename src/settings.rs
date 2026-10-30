@@ -92,6 +92,83 @@ impl NotchWidth {
     }
 }
 
+/// How big the notch opens when hovered, against the default. The whole
+/// open notch scales: its shape and everything on it. The discriminants
+/// are what is stored.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpenSize {
+    Normal = 0,
+    Compact = 1,
+    Large = 2,
+}
+
+impl OpenSize {
+    /// In the order they are offered.
+    pub const ALL: [Self; 3] = [Self::Compact, Self::Normal, Self::Large];
+
+    /// Scale of the open notch.
+    pub fn zoom(self) -> f32 {
+        match self {
+            Self::Compact => 0.9,
+            Self::Normal => 1.0,
+            Self::Large => 1.1,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "Compact",
+            Self::Normal => "Normal",
+            Self::Large => "Large",
+        }
+    }
+}
+
+/// A page of the open notch. The discriminants are what is stored.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum Page {
+    Shelf = 0,
+    Player = 1,
+    Controls = 2,
+}
+
+impl Page {
+    pub const ALL: [Self; 3] = [Self::Shelf, Self::Player, Self::Controls];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Shelf => "Shelf",
+            Self::Player => "Now Playing",
+            Self::Controls => "Control Center",
+        }
+    }
+
+    fn from_u32(v: u32) -> Option<Self> {
+        Self::ALL.into_iter().find(|&p| p as u32 == v)
+    }
+}
+
+/// Every order the three pages can be in; `to_bits` sends the index.
+const PAGE_ORDERS: [[Page; 3]; 6] = [
+    [Page::Shelf, Page::Player, Page::Controls],
+    [Page::Shelf, Page::Controls, Page::Player],
+    [Page::Player, Page::Shelf, Page::Controls],
+    [Page::Player, Page::Controls, Page::Shelf],
+    [Page::Controls, Page::Shelf, Page::Player],
+    [Page::Controls, Page::Player, Page::Shelf],
+];
+
+/// Stored as one DWORD: a page per 4 bits, left to right.
+fn order_to_u32(order: [Page; 3]) -> u32 {
+    order[0] as u32 | (order[1] as u32) << 4 | (order[2] as u32) << 8
+}
+
+/// Only a real order (each page once) is taken.
+fn order_from_u32(v: u32) -> Option<[Page; 3]> {
+    let order = [Page::from_u32(v & 0xF)?, Page::from_u32((v >> 4) & 0xF)?, Page::from_u32((v >> 8) & 0xF)?];
+    PAGE_ORDERS.contains(&order).then_some(order)
+}
+
 /// Label for one of `BLUETOOTH_QUIET_MINUTES`.
 pub fn bluetooth_quiet_label(minutes: u32) -> &'static str {
     match minutes {
@@ -116,6 +193,14 @@ pub struct Settings {
     pub width: NotchWidth,
     /// One of `BLUETOOTH_QUIET_MINUTES`.
     pub bluetooth_quiet_minutes: u32,
+    pub open_size: OpenSize,
+    /// Run the scripts in the plugins folder (`plugins.rs`). Off until the
+    /// user turns it on: nothing runs that they did not ask for.
+    pub plugins: bool,
+    /// The open notch's pages, left to right.
+    pub page_order: [Page; 3],
+    /// The page the notch opens on.
+    pub start_page: Page,
 }
 
 impl Default for Settings {
@@ -125,6 +210,10 @@ impl Default for Settings {
             duration: AlertDuration::Normal,
             width: NotchWidth::Normal,
             bluetooth_quiet_minutes: 5,
+            open_size: OpenSize::Normal,
+            plugins: false,
+            page_order: PAGE_ORDERS[0],
+            start_page: Page::Player,
         }
     }
 }
@@ -147,11 +236,30 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        Self::from_values(read(w!("Alerts")), read(w!("AlertDuration")), read(w!("NotchWidth")), read(w!("BluetoothQuietMinutes")))
+        Self::from_values(
+            read(w!("Alerts")),
+            read(w!("AlertDuration")),
+            read(w!("NotchWidth")),
+            read(w!("BluetoothQuietMinutes")),
+            read(w!("OpenSize")),
+            read(w!("Plugins")),
+            read(w!("PageOrder")),
+            read(w!("StartPage")),
+        )
     }
 
     /// Settings from stored values, each `None` when missing.
-    fn from_values(alerts: Option<u32>, duration: Option<u32>, width: Option<u32>, quiet: Option<u32>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn from_values(
+        alerts: Option<u32>,
+        duration: Option<u32>,
+        width: Option<u32>,
+        quiet: Option<u32>,
+        open_size: Option<u32>,
+        plugins: Option<u32>,
+        page_order: Option<u32>,
+        start_page: Option<u32>,
+    ) -> Self {
         let default = Self::default();
         let all = default.alerts;
         Self {
@@ -163,20 +271,42 @@ impl Settings {
             bluetooth_quiet_minutes: quiet
                 .filter(|m| BLUETOOTH_QUIET_MINUTES.contains(m))
                 .unwrap_or(default.bluetooth_quiet_minutes),
+            open_size: open_size
+                .and_then(|v| OpenSize::ALL.into_iter().find(|&s| s as u32 == v))
+                .unwrap_or(default.open_size),
+            plugins: plugins.map_or(default.plugins, |v| v == 1),
+            page_order: page_order.and_then(order_from_u32).unwrap_or(default.page_order),
+            start_page: start_page.and_then(Page::from_u32).unwrap_or(default.start_page),
         }
     }
 
     /// Packs the settings into one number, to post in a window message.
+    /// The page order and start page take bits 29 to 33: a 64-bit `usize`
+    /// (the app is x64 only).
     pub fn to_bits(self) -> usize {
         self.alerts as usize
             | (self.duration as usize) << 8
             | (self.width as usize) << 12
             | (self.bluetooth_quiet_minutes as usize) << 16
+            | (self.open_size as usize) << 24
+            | (self.plugins as usize) << 28
+            | PAGE_ORDERS.iter().position(|&o| o == self.page_order).unwrap_or(0) << 29
+            | (self.start_page as usize) << 32
     }
 
     pub fn from_bits(bits: usize) -> Self {
         let field = |shift: u32, mask: usize| Some(((bits >> shift) & mask) as u32);
-        Self::from_values(field(0, 0xFF), field(8, 0xF), field(12, 0xF), field(16, 0xFFFF))
+        // Bluetooth quiet minutes are at most 60: eight bits.
+        Self::from_values(
+            field(0, 0xFF),
+            field(8, 0xF),
+            field(12, 0xF),
+            field(16, 0xFF),
+            field(24, 0xF),
+            field(28, 0x1),
+            PAGE_ORDERS.get((bits >> 29) & 0x7).map(|&o| order_to_u32(o)),
+            field(32, 0x3),
+        )
     }
 
     pub fn save(&self) {
@@ -184,6 +314,10 @@ impl Settings {
         write(w!("AlertDuration"), self.duration as u32);
         write(w!("NotchWidth"), self.width as u32);
         write(w!("BluetoothQuietMinutes"), self.bluetooth_quiet_minutes);
+        write(w!("OpenSize"), self.open_size as u32);
+        write(w!("Plugins"), self.plugins as u32);
+        write(w!("PageOrder"), order_to_u32(self.page_order));
+        write(w!("StartPage"), self.start_page as u32);
     }
 }
 
@@ -244,18 +378,22 @@ mod tests {
 
     #[test]
     fn bad_stored_values_fall_back() {
-        assert_eq!(Settings::from_values(None, None, None, None), Settings::default());
-        let odd = Settings::from_values(Some(u32::MAX), Some(9), Some(7), Some(3));
+        assert_eq!(Settings::from_values(None, None, None, None, None, None, None, None), Settings::default());
+        let odd = Settings::from_values(Some(u32::MAX), Some(9), Some(7), Some(3), Some(9), Some(7), Some(0x111), Some(7));
         assert_eq!(odd, Settings::default());
         // Stored numbers stay what they were before Narrow was added.
-        assert_eq!(Settings::from_values(None, None, Some(0), None).width, NotchWidth::Normal);
-        assert_eq!(Settings::from_values(None, None, Some(2), None).width, NotchWidth::Wider);
-        assert_eq!(Settings::from_values(None, None, Some(3), None).width, NotchWidth::Narrow);
-        let set = Settings::from_values(Some(0), Some(2), Some(1), Some(0));
+        assert_eq!(Settings::from_values(None, None, Some(0), None, None, None, None, None).width, NotchWidth::Normal);
+        assert_eq!(Settings::from_values(None, None, Some(2), None, None, None, None, None).width, NotchWidth::Wider);
+        assert_eq!(Settings::from_values(None, None, Some(3), None, None, None, None, None).width, NotchWidth::Narrow);
+        let set = Settings::from_values(Some(0), Some(2), Some(1), Some(0), Some(2), Some(1), Some(0x012), Some(0));
         assert!(AlertKind::ALL.iter().all(|&kind| !set.alert_enabled(kind)));
         assert_eq!(set.duration, AlertDuration::Long);
         assert_eq!(set.width, NotchWidth::Wide);
         assert_eq!(set.bluetooth_quiet(), Duration::ZERO);
+        assert_eq!(set.open_size, OpenSize::Large);
+        assert!(set.plugins);
+        assert_eq!(set.page_order, [Page::Controls, Page::Player, Page::Shelf]);
+        assert_eq!(set.start_page, Page::Shelf);
     }
 
     #[test]
@@ -266,6 +404,10 @@ mod tests {
         settings.set_alert(AlertKind::NowPlaying, false);
         settings.duration = AlertDuration::Short;
         settings.width = NotchWidth::Narrow;
+        settings.open_size = OpenSize::Compact;
+        settings.plugins = true;
+        settings.page_order = [Page::Player, Page::Controls, Page::Shelf];
+        settings.start_page = Page::Controls;
         settings.bluetooth_quiet_minutes = 60;
         assert_eq!(Settings::from_bits(settings.to_bits()), settings);
     }

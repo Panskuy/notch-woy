@@ -1,13 +1,15 @@
 //! Reads the system "now playing" session (Spotify, browsers, Media Player...)
 //! on a background thread and sends media commands back to it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tiny_skia::{IntSize, Pixmap};
-use windows::core::Result;
+use windows::core::{IUnknown, Interface, Result};
+use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Imaging::*;
 use windows::Media::Control::*;
 use windows::Storage::Streams::IRandomAccessStreamReference;
@@ -21,6 +23,11 @@ use crate::palette::{self, Rgb};
 pub const WM_MEDIA: u32 = WM_APP + 2;
 
 const POLL: Duration = Duration::from_millis(500);
+/// After a track change the art is read again on every poll for this long,
+/// whether or not the player said it changed: browsers (Chromium: Brave,
+/// Chrome, Edge) publish the new title first, with the previous track's
+/// art or their own icon, and the track's art a moment later.
+const ART_SETTLE: Duration = Duration::from_secs(4);
 /// Album art is decoded to a square of this size (physical pixels).
 const ART_SIZE: u32 = 160;
 
@@ -56,7 +63,12 @@ impl NowPlaying {
             && self.artist == other.artist
             && self.album == other.album
             && self.playing == other.playing
-            && self.art.is_some() == other.art.is_some()
+            // Art read again for the same track keeps its `Arc` unless
+            // the picture changed (`read`), so this notices a corrected one.
+            && match (&self.art, &other.art) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (a, b) => a.is_none() == b.is_none(),
+            }
             && self.timeline == other.timeline
     }
 
@@ -142,6 +154,14 @@ fn run(hwnd: isize, rx: Receiver<Command>, shared: Arc<Mutex<Option<NowPlaying>>
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
     let manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?.get()?;
     let mut last: Option<NowPlaying> = None;
+    // Set by the current session when its title, artist or art change, so
+    // the art is read again rather than kept from the first read.
+    let art_stale = Arc::new(AtomicBool::new(false));
+    // The session whose changes are watched: its identity and the handler's
+    // registration, to move the handler when another session takes over.
+    let mut watched: Option<(GlobalSystemMediaTransportControlsSession, usize, i64)> = None;
+    // When the playing track (title and artist) last changed.
+    let mut track_since = Instant::now();
 
     loop {
         match rx.recv_timeout(POLL) {
@@ -156,7 +176,13 @@ fn run(hwnd: isize, rx: Receiver<Command>, shared: Arc<Mutex<Option<NowPlaying>>
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
 
-        let next = read(&manager, last.as_ref());
+        watch(&manager, &mut watched, &art_stale);
+        let settling = track_since.elapsed() < ART_SETTLE;
+        let recheck = art_stale.swap(false, Ordering::Relaxed) || settling;
+        let next = read(&manager, last.as_ref(), recheck);
+        if track_changed(last.as_ref(), next.as_ref()) {
+            track_since = Instant::now();
+        }
         let changed = match (&last, &next) {
             (Some(a), Some(b)) => !a.same_as(b),
             (None, None) => false,
@@ -188,11 +214,44 @@ fn execute(session: &GlobalSystemMediaTransportControlsSession, command: Command
     Ok(())
 }
 
-/// Returns `None` when nothing is playing. Reuses the previous art while the
-/// track is unchanged so the thumbnail is only decoded once per track.
+/// Keeps a `MediaPropertiesChanged` handler on the current session, which
+/// flags `stale` when its title, artist or art change.
+fn watch(
+    manager: &GlobalSystemMediaTransportControlsSessionManager,
+    watched: &mut Option<(GlobalSystemMediaTransportControlsSession, usize, i64)>,
+    stale: &Arc<AtomicBool>,
+) {
+    let current = manager.GetCurrentSession().ok();
+    // COM identity: the same session always gives the same IUnknown.
+    let id = current.as_ref().and_then(|s| s.cast::<IUnknown>().ok()).map(|u| u.as_raw() as usize);
+    if watched.as_ref().map(|(_, id, _)| *id) == id {
+        return;
+    }
+    if let Some((session, _, token)) = watched.take() {
+        let _ = session.RemoveMediaPropertiesChanged(token);
+    }
+    let (Some(session), Some(id)) = (current, id) else { return };
+    let flag = stale.clone();
+    let handler = TypedEventHandler::new(move |_, _| {
+        flag.store(true, Ordering::Relaxed);
+        Ok(())
+    });
+    match session.MediaPropertiesChanged(&handler) {
+        Ok(token) => *watched = Some((session, id, token)),
+        Err(e) => eprintln!("media: cannot watch session: {e}"),
+    }
+    // A new session's art is read afresh.
+    stale.store(true, Ordering::Relaxed);
+}
+
+/// Returns `None` when nothing is playing. While the track is unchanged its
+/// art is decoded once and reused, unless `recheck` (the player said it
+/// changed, or the track just started): then it is read again, and kept as
+/// the same `Arc` when the picture is the same.
 fn read(
     manager: &GlobalSystemMediaTransportControlsSessionManager,
     prev: Option<&NowPlaying>,
+    recheck: bool,
 ) -> Option<NowPlaying> {
     let session = manager.GetCurrentSession().ok()?;
     let props = session.TryGetMediaPropertiesAsync().ok()?.get().ok()?;
@@ -211,12 +270,21 @@ fn read(
     let cached = prev
         .filter(|p| p.title == title && p.artist == artist)
         .and_then(|p| p.art.clone());
-    // Players often publish the title before the thumbnail, so a missing
-    // art is retried on the next poll.
-    let art = cached.or_else(|| {
-        let thumb = props.Thumbnail().ok()?;
-        decode_art(&thumb).ok().flatten().map(Arc::new)
-    });
+    // Players often publish the title before the thumbnail (or with the
+    // wrong one), so a missing art is retried on the next poll, and a
+    // present one read again while `recheck`.
+    let art = match cached {
+        Some(art) if !recheck => Some(art),
+        cached => {
+            let fresh = props.Thumbnail().ok().and_then(|thumb| decode_art(&thumb).ok().flatten());
+            match (fresh, cached) {
+                (Some(fresh), Some(cached)) if fresh.pixmap.data() == cached.pixmap.data() => Some(cached),
+                (Some(fresh), _) => Some(Arc::new(fresh)),
+                // No thumbnail now: keep what was shown for this track.
+                (None, cached) => cached,
+            }
+        }
+    };
 
     Some(NowPlaying { title, artist, album, playing, art, timeline })
 }
@@ -287,4 +355,42 @@ pub fn decode_square(source: &IRandomAccessStreamReference, size: u32) -> Result
         .DetachPixelData()?;
     let Some(size) = IntSize::from_wh(size, size) else { return Ok(None) };
     Ok(Pixmap::from_vec(pixels.to_vec(), size))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(art: Option<Arc<Artwork>>) -> NowPlaying {
+        NowPlaying {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: String::new(),
+            playing: true,
+            art,
+            timeline: None,
+        }
+    }
+
+    fn artwork(shade: u8) -> Arc<Artwork> {
+        let mut pixmap = Pixmap::new(4, 4).unwrap();
+        pixmap.fill(tiny_skia::Color::from_rgba8(shade, shade, shade, 255));
+        Arc::new(Artwork { tint: [shade; 3], pixmap })
+    }
+
+    #[test]
+    fn notices_corrected_art() {
+        // A browser first shows its own icon, then the track's cover: same
+        // title and artist, so only the art tells them apart.
+        let (icon, cover) = (artwork(10), artwork(200));
+        let first = track(Some(icon.clone()));
+        let corrected = track(Some(cover));
+        assert!(!first.same_as(&corrected));
+        assert!(art_changed(Some(&first), Some(&corrected)));
+        assert!(!track_changed(Some(&first), Some(&corrected)));
+        // The same art read again (kept as the same Arc) is no change.
+        let again = track(Some(icon));
+        assert!(first.same_as(&again));
+        assert!(!art_changed(Some(&first), Some(&again)));
+    }
 }

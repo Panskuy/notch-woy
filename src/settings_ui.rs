@@ -17,7 +17,7 @@ use crate::render::{
     COLLAPSED_BATTERY_WIDTH,
     EXPANDED,
 };
-use crate::settings::{bluetooth_quiet_label, AlertDuration, AlertKind, NotchWidth, Settings};
+use crate::settings::{bluetooth_quiet_label, AlertDuration, AlertKind, NotchWidth, OpenSize, Page, Settings};
 
 pub const WIDTH: f32 = 700.0;
 pub const HEIGHT: f32 = 420.0;
@@ -44,6 +44,8 @@ const SEGMENT_W: f32 = 62.0;
 const POPUP_W: f32 = 176.0;
 const RESET_W: f32 = 156.0;
 const BUTTON_H: f32 = 28.0;
+/// The Open Folder button in the Plugins row.
+const FOLDER_W: f32 = 104.0;
 
 /// Where the notch preview and the cards below it start.
 const CARD_Y: f32 = BODY_Y + PREVIEW_H + 20.0;
@@ -53,18 +55,47 @@ pub enum Pane {
     General,
     Alerts,
     Notch,
+    Layout,
 }
 
 impl Pane {
-    pub const ALL: [Self; 3] = [Self::General, Self::Alerts, Self::Notch];
+    pub const ALL: [Self; 4] = [Self::General, Self::Alerts, Self::Notch, Self::Layout];
 
     fn title(self) -> &'static str {
         match self {
             Self::General => "General",
             Self::Alerts => "Alerts",
             Self::Notch => "Notch",
+            Self::Layout => "Layout",
         }
     }
+}
+
+/// The order `order` becomes with `page` dropped at `place` (in rows from
+/// the top, fractional while dragged): the nearest place, the others
+/// closing up around it.
+pub fn reorder(order: [Page; 3], page: Page, place: f32) -> [Page; 3] {
+    let mut rest: Vec<Page> = order.into_iter().filter(|&p| p != page).collect();
+    rest.insert(place.round().clamp(0.0, 2.0) as usize, page);
+    [rest[0], rest[1], rest[2]]
+}
+
+/// The Layout pane's stage: a wallpaper with the pages on it as cards,
+/// dragged sideways into another order, as Home Screen pages on an iPhone.
+const STAGE_H: f32 = 244.0;
+const PAGE_CARD_W: f32 = 122.0;
+const PAGE_CARD_H: f32 = 150.0;
+const PAGE_CARD_GAP: f32 = 20.0;
+/// From one card to the next.
+pub const PAGE_PITCH: f32 = PAGE_CARD_W + PAGE_CARD_GAP;
+const PAGE_CARD_Y: f32 = BODY_Y + 34.0;
+/// How much bigger a lifted (dragged) card is.
+const LIFT: f32 = 1.07;
+
+/// The card for the page in `place` (0 = left, fractional while it moves).
+pub fn page_card(place: f32) -> Rect {
+    let x0 = CONTENT_X + (CONTENT_W - (3.0 * PAGE_CARD_W + 2.0 * PAGE_CARD_GAP)) / 2.0;
+    Rect { x: x0 + place * PAGE_PITCH, y: PAGE_CARD_Y, w: PAGE_CARD_W, h: PAGE_CARD_H }
 }
 
 /// Everything that can be clicked or focused.
@@ -73,10 +104,20 @@ pub enum Control {
     Sidebar,
     Alert(AlertKind),
     Autostart,
+    /// Run the plugins folder's scripts.
+    Plugins,
+    /// Opens the plugins folder.
+    PluginsFolder,
     Width,
+    OpenSize,
     Duration,
     BluetoothQuiet,
     Reset,
+    /// The page in this place of the Layout list (0 = left), to drag (or
+    /// move with the arrow keys) into another place.
+    PageRow(usize),
+    /// The pop-up for the page the notch opens on.
+    StartPage,
 }
 
 /// A point on a control: which segment, for segmented controls.
@@ -157,6 +198,7 @@ const BLUE: Rgb = [0, 122, 255];
 const GRAY: Rgb = [142, 142, 147];
 const GREEN: Rgb = [52, 199, 89];
 const INDIGO: Rgb = [88, 86, 214];
+const TEAL: Rgb = [48, 176, 199];
 
 /// What the window shows, animated values included.
 pub struct View {
@@ -164,14 +206,20 @@ pub struct View {
     pub pane: Pane,
     pub settings: Settings,
     /// How far each switch is on, 0..1: the alerts in `AlertKind::ALL`
-    /// order, then Start at login.
-    pub switches: [f32; 6],
+    /// order, then Start at login, then Plugins.
+    pub switches: [f32; SWITCHES],
     /// The selection of the width and duration controls, as a fractional
     /// segment index while it slides.
     pub width_selection: f32,
+    pub open_size_selection: f32,
     pub duration_selection: f32,
     /// The preview notch's resting width.
     pub preview_width: f32,
+    /// Per page (`Page as usize`), its place in the Layout list and
+    /// preview, fractional while it moves (0 = left / top).
+    pub page_rows: [f32; 3],
+    /// The page being dragged in the Layout list, if any.
+    pub page_dragging: Option<Page>,
     pub battery: Option<Battery>,
     /// The time on the preview notch's clock.
     pub time: String,
@@ -195,11 +243,15 @@ impl Rect {
     }
 }
 
+/// Number of switches: one per alert, Start at login, Plugins.
+pub const SWITCHES: usize = AlertKind::ALL.len() + 2;
+
 /// Index of the switch for `control` in `View::switches`.
 pub fn switch_index(control: Control) -> Option<usize> {
     match control {
         Control::Alert(kind) => AlertKind::ALL.iter().position(|&k| k == kind),
         Control::Autostart => Some(AlertKind::ALL.len()),
+        Control::Plugins => Some(AlertKind::ALL.len() + 1),
         _ => None,
     }
 }
@@ -208,9 +260,10 @@ pub fn switch_index(control: Control) -> Option<usize> {
 pub fn focus_order(pane: Pane) -> Vec<Control> {
     let mut order = vec![Control::Sidebar];
     match pane {
-        Pane::General => order.extend([Control::Autostart, Control::Reset]),
+        Pane::General => order.extend([Control::Autostart, Control::Plugins, Control::PluginsFolder, Control::Reset]),
         Pane::Alerts => order.extend(AlertKind::ALL.map(Control::Alert)),
-        Pane::Notch => order.extend([Control::Width, Control::Duration, Control::BluetoothQuiet]),
+        Pane::Notch => order.extend([Control::Width, Control::OpenSize, Control::Duration, Control::BluetoothQuiet]),
+        Pane::Layout => order.extend([Control::PageRow(0), Control::PageRow(1), Control::PageRow(2), Control::StartPage]),
     }
     order
 }
@@ -219,6 +272,7 @@ pub fn focus_order(pane: Pane) -> Vec<Control> {
 pub fn segments(control: Control) -> usize {
     match control {
         Control::Width => NotchWidth::ALL.len(),
+        Control::OpenSize => OpenSize::ALL.len(),
         Control::Duration => AlertDuration::ALL.len(),
         _ => 0,
     }
@@ -231,10 +285,24 @@ fn sidebar_item(pane: Pane) -> Rect {
 
 /// A row of the card in `pane` that holds `control`, and the row's height.
 fn row(pane: Pane, control: Control) -> Option<Rect> {
+    if pane == Pane::Layout {
+        // The pages are cards on the stage; Opens To a row below it.
+        return match control {
+            Control::PageRow(i) if i < 3 => Some(page_card(i as f32)),
+            Control::StartPage => Some(Rect { x: CONTENT_X, y: BODY_Y + STAGE_H + 36.0, w: CONTENT_W, h: ROW_H }),
+            _ => None,
+        };
+    }
     let rows: Vec<(Control, f32)> = match pane {
-        Pane::General => vec![(Control::Autostart, ROW_H)],
+        Pane::General => vec![(Control::Autostart, ROW_H), (Control::Plugins, ROW_H)],
         Pane::Alerts => AlertKind::ALL.map(|kind| (Control::Alert(kind), ROW_H)).to_vec(),
-        Pane::Notch => vec![(Control::Width, 52.0), (Control::Duration, 52.0), (Control::BluetoothQuiet, 56.0)],
+        Pane::Notch => vec![
+            (Control::Width, 50.0),
+            (Control::OpenSize, 50.0),
+            (Control::Duration, 50.0),
+            (Control::BluetoothQuiet, 56.0),
+        ],
+        Pane::Layout => Vec::new(),
     };
     let mut y = card_top(pane);
     for (c, h) in rows {
@@ -249,7 +317,7 @@ fn row(pane: Pane, control: Control) -> Option<Rect> {
 fn card_top(pane: Pane) -> f32 {
     match pane {
         Pane::Alerts => BODY_Y,
-        Pane::General | Pane::Notch => CARD_Y,
+        Pane::General | Pane::Notch | Pane::Layout => CARD_Y,
     }
 }
 
@@ -260,21 +328,29 @@ pub fn control_rect(pane: Pane, control: Control) -> Option<Rect> {
     }
     if control == Control::Reset {
         return (pane == Pane::General).then(|| {
-            let card = row(pane, Control::Autostart).expect("General has Start at login");
+            let card = row(pane, Control::Plugins).expect("General has Plugins");
             Rect { x: CONTENT_X + CONTENT_W - RESET_W, y: card.y + card.h + 16.0, w: RESET_W, h: BUTTON_H }
         });
     }
-    let r = row(pane, control)?;
+    // The folder button sits in the Plugins row, left of its switch.
+    let r = row(pane, if control == Control::PluginsFolder { Control::Plugins } else { control })?;
     let right = r.x + r.w - ROW_PAD;
     Some(match control {
-        Control::Alert(_) | Control::Autostart => {
+        Control::PluginsFolder => {
+            Rect { x: right - SWITCH_W - 12.0 - FOLDER_W, y: r.y + (r.h - BUTTON_H) / 2.0, w: FOLDER_W, h: BUTTON_H }
+        }
+        Control::Alert(_) | Control::Autostart | Control::Plugins => {
             Rect { x: right - SWITCH_W, y: r.y + (r.h - SWITCH_H) / 2.0, w: SWITCH_W, h: SWITCH_H }
         }
-        Control::Width | Control::Duration => {
+        Control::Width | Control::OpenSize | Control::Duration => {
             let w = SEGMENT_W * segments(control) as f32;
             Rect { x: right - w, y: r.y + (r.h - SEGMENT_H) / 2.0, w, h: SEGMENT_H }
         }
-        Control::BluetoothQuiet => Rect { x: right - POPUP_W, y: r.y + (r.h - SEGMENT_H) / 2.0, w: POPUP_W, h: SEGMENT_H },
+        Control::BluetoothQuiet | Control::StartPage => {
+            Rect { x: right - POPUP_W, y: r.y + (r.h - SEGMENT_H) / 2.0, w: POPUP_W, h: SEGMENT_H }
+        }
+        // A page's whole row: it is dragged by any part of it.
+        Control::PageRow(_) => r,
         Control::Sidebar | Control::Reset => unreachable!(),
     })
 }
@@ -287,12 +363,15 @@ pub fn hit(pane: Pane, pos: (f32, f32)) -> Option<Hit> {
     for control in focus_order(pane).into_iter().skip(1) {
         let Some(rect) = control_rect(pane, control) else { continue };
         match control {
-            Control::Alert(_) | Control::Autostart => {
-                if row(pane, control).is_some_and(|r| r.contains(pos)) {
+            Control::PageRow(_) if rect.contains(pos) => return Some(Hit::Control(control)),
+            Control::Alert(_) | Control::Autostart | Control::Plugins => {
+                // The whole row toggles, except the folder button in it.
+                let on_folder = control_rect(pane, Control::PluginsFolder).is_some_and(|f| f.contains(pos));
+                if row(pane, control).is_some_and(|r| r.contains(pos)) && !(control == Control::Plugins && on_folder) {
                     return Some(Hit::Control(control));
                 }
             }
-            Control::Width | Control::Duration if rect.contains(pos) => {
+            Control::Width | Control::OpenSize | Control::Duration if rect.contains(pos) => {
                 let i = ((pos.0 - rect.x) / SEGMENT_W) as usize;
                 return Some(Hit::Segment(control, i.min(segments(control) - 1)));
             }
@@ -421,6 +500,7 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, fonts: &Fonts, view: &View, cache: 
         Pane::General => general(&mut p, &c, view, cache),
         Pane::Alerts => alerts(&mut p, &c, view),
         Pane::Notch => notch(&mut p, &c, view, cache),
+        Pane::Layout => layout(&mut p, &c, view),
     }
 }
 
@@ -603,6 +683,8 @@ impl PreviewCache {
                     controls: ControlsView::default(),
                     clock: 0.0,
                     levels: None,
+                    open_zoom: 1.0,
+                    page_order: Page::ALL,
                     time: &view.time,
                     outputs: OutputsView::default(),
                     shelf: ShelfView::default(),
@@ -620,22 +702,7 @@ impl PreviewCache {
 /// width, drawn by the notch's own renderer.
 fn preview(p: &mut Painter, c: &Colors, view: &View, cache: &mut PreviewCache) {
     let r = Rect { x: CONTENT_X, y: BODY_Y, w: CONTENT_W, h: PREVIEW_H };
-    let Some(card) = rounded_rect(r.x, r.y, r.w, r.h, CARD_RADIUS) else { return };
-    let gradient = LinearGradient::new(
-        Point::from_xy(r.x, r.y),
-        Point::from_xy(r.x + r.w, r.y + r.h),
-        vec![
-            GradientStop::new(0.0, Color::from_rgba8(c.wallpaper[0][0], c.wallpaper[0][1], c.wallpaper[0][2], 255)),
-            GradientStop::new(1.0, Color::from_rgba8(c.wallpaper[1][0], c.wallpaper[1][1], c.wallpaper[1][2], 255)),
-        ],
-        SpreadMode::Pad,
-        Transform::identity(),
-    );
-    if let Some(shader) = gradient {
-        let paint = Paint { shader, anti_alias: true, ..Default::default() };
-        let ts = p.ts();
-        p.pixmap.fill_path(&card, &paint, FillRule::Winding, ts, None);
-    }
+    wallpaper(p, c, r);
 
     // The notch renderer centers the notch on its canvas and hangs it from
     // the top edge, like the real screen. Its corners are clear, so the
@@ -661,10 +728,16 @@ fn preview(p: &mut Painter, c: &Colors, view: &View, cache: &mut PreviewCache) {
 
 fn general(p: &mut Painter, c: &Colors, view: &View, cache: &mut PreviewCache) {
     preview(p, c, view, cache);
-    let Some(r) = row(Pane::General, Control::Autostart) else { return };
-    card(p, c, &[r]);
+    let (Some(r), Some(plugins)) = (row(Pane::General, Control::Autostart), row(Pane::General, Control::Plugins)) else {
+        return;
+    };
+    card(p, c, &[r, plugins]);
     row_label(p, c, r, |p, t| tile_icon(p, t, GRAY, Glyph::Power), "Start at login", Some("Opens notch-woy when you sign in"));
     switch(p, c, view, Control::Autostart);
+    let subtitle = Some("Scripts in the plugins folder");
+    row_label(p, c, plugins, |p, t| tile_icon(p, t, ORANGE, Glyph::Gear), "Plugins", subtitle);
+    button(p, c, view, Control::PluginsFolder, "Open Folder", false);
+    switch(p, c, view, Control::Plugins);
     button(p, c, view, Control::Reset, "Reset to Defaults...", false);
     if let Some(reset) = control_rect(Pane::General, Control::Reset) {
         let note = "Changes apply right away.";
@@ -694,12 +767,15 @@ fn alerts(p: &mut Painter, c: &Colors, view: &View) {
 
 fn notch(p: &mut Painter, c: &Colors, view: &View, cache: &mut PreviewCache) {
     preview(p, c, view, cache);
-    let controls = [Control::Width, Control::Duration, Control::BluetoothQuiet];
+    let controls = [Control::Width, Control::OpenSize, Control::Duration, Control::BluetoothQuiet];
     let rows: Vec<Rect> = controls.iter().filter_map(|&k| row(Pane::Notch, k)).collect();
     card(p, c, &rows);
-    let [width, duration, quiet] = [rows[0], rows[1], rows[2]];
+    let [width, open_size, duration, quiet] = [rows[0], rows[1], rows[2], rows[3]];
     row_label(p, c, width, |p, t| tile_icon(p, t, PURPLE, Glyph::Arrows), "Resting width", None);
     segmented(p, c, view, Control::Width, &NotchWidth::ALL.map(NotchWidth::label), view.width_selection);
+    row_label(p, c, open_size, |p, t| tile_icon(p, t, INDIGO, Glyph::Pill), "Open size", Some("When hovered"));
+    let sizes = OpenSize::ALL.map(OpenSize::label);
+    segmented(p, c, view, Control::OpenSize, &sizes, view.open_size_selection);
     row_label(p, c, duration, |p, t| tile_icon(p, t, ORANGE, Glyph::Clock), "Alert duration", None);
     let durations = AlertDuration::ALL.map(AlertDuration::label);
     segmented(p, c, view, Control::Duration, &durations, view.duration_selection);
@@ -721,6 +797,10 @@ enum Glyph {
     Power,
     Arrows,
     Clock,
+    /// An arrow into an open tray (the shelf).
+    Tray,
+    /// Three columns side by side (the Layout pane).
+    Columns,
 }
 
 fn pane_icon(p: &mut Painter, pane: Pane, r: Rect) {
@@ -728,6 +808,182 @@ fn pane_icon(p: &mut Painter, pane: Pane, r: Rect) {
         Pane::General => tile_icon(p, r, GRAY, Glyph::Gear),
         Pane::Alerts => tile_icon(p, r, RED, Glyph::Bell),
         Pane::Notch => tile_icon(p, r, INDIGO, Glyph::Pill),
+        Pane::Layout => tile_icon(p, r, TEAL, Glyph::Columns),
+    }
+}
+
+/// The Layout pane, like arranging Home Screen pages on an iPhone: the
+/// open notch's pages as cards on the wallpaper, each a sketch of what it
+/// shows. Drag a card sideways into another place (it lifts, the others
+/// make room); click one to open the notch on it (ringed, with a badge).
+/// Page dots and names below, and the same choice as a pop-up.
+fn layout(p: &mut Painter, c: &Colors, view: &View) {
+    let stage = Rect { x: CONTENT_X, y: BODY_Y, w: CONTENT_W, h: STAGE_H };
+    wallpaper(p, c, stage);
+    let start = view.settings.start_page;
+    // The dragged card last, over the others.
+    let mut pages = Page::ALL;
+    pages.sort_by_key(|&page| view.page_dragging == Some(page));
+    for page in pages {
+        let lifted = view.page_dragging == Some(page);
+        let mut card = page_card(view.page_rows[page as usize]);
+        if lifted {
+            let (dw, dh) = (card.w * (LIFT - 1.0), card.h * (LIFT - 1.0));
+            card = Rect { x: card.x - dw / 2.0, y: card.y - dh / 2.0, w: card.w + dw, h: card.h + dh };
+        }
+        p.shadow(card, 16.0, if lifted { 1.0 } else { 0.5 });
+        p.rrect(card, 16.0, [8, 8, 10], 1.0);
+        page_sketch(p, page, card);
+        // Hovered: a soft light; pressed: a little darker.
+        if view.pressed == Some(Hit::Control(Control::PageRow(place_of(view, page)))) && !lifted {
+            p.rrect(card, 16.0, [0, 0, 0], 0.18);
+        } else if view.hover == Some(Hit::Control(Control::PageRow(place_of(view, page)))) && view.page_dragging.is_none() {
+            p.rrect(card, 16.0, WHITE, 0.05);
+        }
+        let label_y = card.y + card.h + 18.0;
+        p.text_centered(p.fonts.semibold(), page.label(), 12.0, card.x + card.w / 2.0, label_y, WHITE, 0.95);
+        if page == start {
+            // Where the notch opens: ringed, with a badge on top.
+            if let Some(ring) = rounded_rect(card.x - 3.5, card.y - 3.5, card.w + 7.0, card.h + 7.0, 19.0) {
+                p.stroke(&ring, 2.5, c.accent, 1.0);
+            }
+            let badge_w = p.text_width(p.fonts.semibold(), "Opens first", 10.5) + 16.0;
+            let badge = Rect { x: card.x + (card.w - badge_w) / 2.0, y: card.y - 13.0, w: badge_w, h: 18.0 };
+            p.rrect(badge, 9.0, c.accent, 1.0);
+            p.text_centered(p.fonts.semibold(), "Opens first", 10.5, badge.x + badge_w / 2.0, badge.y + 13.0, WHITE, 1.0);
+        }
+    }
+    for i in 0..3 {
+        if view.focus == Some(Control::PageRow(i)) && view.page_dragging.is_none() {
+            let r = page_card(i as f32);
+            p.focus_ring(r, 16.0, c.accent);
+        }
+    }
+    // Page dots, as under an iPhone's Home Screen: the opening page's bright.
+    let dots_y = stage.y + stage.h - 18.0;
+    let start_place = view.page_rows[start as usize];
+    for i in 0..3 {
+        let x = stage.x + stage.w / 2.0 + (i as f32 - 1.0) * 14.0;
+        let bright = (1.0 - (start_place - i as f32).abs()).clamp(0.0, 1.0);
+        if let Some(dot) = PathBuilder::from_circle(x, dots_y, 3.5) {
+            p.fill(&dot, WHITE, 0.4 + 0.55 * bright);
+        }
+    }
+    let hint = "Drag a page to move it. Click one to open the notch on it.";
+    p.text_centered(p.fonts.regular(), hint, 11.5, stage.x + stage.w / 2.0, stage.y + stage.h + 20.0, c.secondary, 1.0);
+
+    let Some(opens) = row(Pane::Layout, Control::StartPage) else { return };
+    card(p, c, &[opens]);
+    row_label(p, c, opens, |p, t| tile_icon(p, t, INDIGO, Glyph::Pill), "Opens to", Some("When you point at the notch"));
+    button(p, c, view, Control::StartPage, start.label(), true);
+}
+
+/// The place (0 = left) `page` has in the saved order.
+fn place_of(view: &View, page: Page) -> usize {
+    view.settings.page_order.iter().position(|&p| p == page).unwrap_or(0)
+}
+
+/// A small drawing of what `page` shows, on its card: a sketch of the
+/// real page, the way Home Screen pages are shown when arranging them.
+fn page_sketch(p: &mut Painter, page: Page, card: Rect) {
+    // Drawn for a PAGE_CARD_W-wide card and scaled to fit (a lifted card).
+    let k = card.w / PAGE_CARD_W;
+    let at = |x: f32, y: f32, w: f32, h: f32| Rect { x: card.x + x * k, y: card.y + y * k, w: w * k, h: h * k };
+    let pill = |p: &mut Painter, r: Rect, rgb: Rgb, alpha: f32| p.rrect(r, r.h / 2.0, rgb, alpha);
+    match page {
+        Page::Player => {
+            // Cover, title and artist, progress, the buttons.
+            let cover = at(14.0, 18.0, 40.0, 40.0);
+            p.rrect(cover, 9.0 * k, PINK, 1.0);
+            tile_icon(p, Rect { x: cover.x + 7.0 * k, y: cover.y + 7.0 * k, w: 26.0 * k, h: 26.0 * k }, PINK, Glyph::Note);
+            pill(p, at(62.0, 26.0, 44.0, 7.0), WHITE, 0.9);
+            pill(p, at(62.0, 40.0, 32.0, 6.0), WHITE, 0.4);
+            pill(p, at(14.0, 74.0, 94.0, 5.0), WHITE, 0.25);
+            pill(p, at(14.0, 74.0, 40.0, 5.0), WHITE, 0.9);
+            for (x, w) in [(26.0, 14.0), (52.0, 18.0), (82.0, 14.0)] {
+                pill(p, at(x, 94.0, w, 12.0), WHITE, 0.85);
+            }
+            // Lyrics, fading down.
+            for (i, w) in [70.0, 52.0, 62.0].into_iter().enumerate() {
+                pill(p, at(14.0, 118.0 + i as f32 * 10.0, w, 5.0), WHITE, 0.35 - i as f32 * 0.1);
+            }
+        }
+        Page::Controls => {
+            // The connectivity platter's four toggles, two sliders, a module.
+            p.rrect(at(10.0, 14.0, 56.0, 56.0), 14.0 * k, WHITE, 0.1);
+            for (i, rgb) in [[62u8, 62, 66], BLUE, BLUE, [62, 62, 66]].into_iter().enumerate() {
+                let (cx, cy) = (24.0 + (i % 2) as f32 * 28.0, 28.0 + (i / 2) as f32 * 28.0);
+                if let Some(disc) = PathBuilder::from_circle(card.x + cx * k, card.y + cy * k, 10.0 * k) {
+                    p.fill(&disc, rgb, 1.0);
+                }
+            }
+            for (x, level) in [(74.0, 0.6), (94.0, 0.4)] {
+                let track = at(x, 14.0, 16.0, 56.0);
+                p.rrect(track, 8.0 * k, WHITE, 0.16);
+                let lh = track.h * level;
+                p.rrect(Rect { x: track.x, y: track.y + track.h - lh, w: track.w, h: lh }, 8.0 * k, WHITE, 0.9);
+            }
+            p.rrect(at(10.0, 80.0, 100.0, 26.0), 10.0 * k, WHITE, 0.1);
+            p.rrect(at(16.0, 85.0, 16.0, 16.0), 4.0 * k, PINK, 0.9);
+            pill(p, at(38.0, 88.0, 40.0, 5.0), WHITE, 0.8);
+            pill(p, at(38.0, 96.0, 26.0, 4.0), WHITE, 0.4);
+            p.rrect(at(10.0, 114.0, 30.0, 26.0), 10.0 * k, WHITE, 0.1);
+            p.rrect(at(46.0, 114.0, 64.0, 26.0), 10.0 * k, WHITE, 0.1);
+            if let Some(ring) = PathBuilder::from_circle(card.x + 25.0 * k, card.y + 127.0 * k, 7.5 * k) {
+                p.stroke(&ring, 2.5 * k, GREEN, 1.0);
+            }
+        }
+        Page::Shelf => {
+            // A header with Share and Clear All, then files.
+            pill(p, at(12.0, 16.0, 30.0, 7.0), WHITE, 0.85);
+            pill(p, at(74.0, 13.0, 36.0, 13.0), WHITE, 0.14);
+            for (i, (x, rgb)) in [(14.0, [70u8, 130, 180]), (48.0, WHITE), (82.0, WHITE)].into_iter().enumerate() {
+                let icon = at(x, 40.0, 26.0, 30.0);
+                if i == 0 {
+                    p.rrect(icon, 3.0 * k, rgb, 1.0);
+                } else {
+                    // A page with a folded corner.
+                    let mut pb = PathBuilder::new();
+                    let fold = 7.0 * k;
+                    pb.move_to(icon.x, icon.y);
+                    pb.line_to(icon.x + icon.w - fold, icon.y);
+                    pb.line_to(icon.x + icon.w, icon.y + fold);
+                    pb.line_to(icon.x + icon.w, icon.y + icon.h);
+                    pb.line_to(icon.x, icon.y + icon.h);
+                    pb.close();
+                    if let Some(path) = pb.finish() {
+                        p.fill(&path, rgb, 0.85);
+                    }
+                }
+                pill(p, at(x - 2.0, 76.0, 30.0, 4.5), WHITE, 0.6);
+            }
+            // The drop zone's dashed edge, faint.
+            p.rrect(at(12.0, 96.0, 98.0, 40.0), 9.0 * k, WHITE, 0.06);
+            if let Some(zone) = rounded_rect(card.x + 12.0 * k, card.y + 96.0 * k, 98.0 * k, 40.0 * k, 9.0 * k) {
+                p.stroke(&zone, 1.0, WHITE, 0.3);
+            }
+            tile_icon(p, at(48.0, 103.0, 26.0, 26.0), ORANGE, Glyph::Tray);
+        }
+    }
+}
+
+/// The desktop-like backdrop of a pane's preview card.
+fn wallpaper(p: &mut Painter, c: &Colors, r: Rect) {
+    let Some(card) = rounded_rect(r.x, r.y, r.w, r.h, CARD_RADIUS) else { return };
+    let gradient = LinearGradient::new(
+        Point::from_xy(r.x, r.y),
+        Point::from_xy(r.x + r.w, r.y + r.h),
+        vec![
+            GradientStop::new(0.0, Color::from_rgba8(c.wallpaper[0][0], c.wallpaper[0][1], c.wallpaper[0][2], 255)),
+            GradientStop::new(1.0, Color::from_rgba8(c.wallpaper[1][0], c.wallpaper[1][1], c.wallpaper[1][2], 255)),
+        ],
+        SpreadMode::Pad,
+        Transform::identity(),
+    );
+    if let Some(shader) = gradient {
+        let paint = Paint { shader, anti_alias: true, ..Default::default() };
+        let ts = p.ts();
+        p.pixmap.fill_path(&card, &paint, FillRule::Winding, ts, None);
     }
 }
 
@@ -845,6 +1101,16 @@ fn tile_icon(p: &mut Painter, r: Rect, rgb: Rgb, glyph: Glyph) {
             }
             line(p, &[(0.0, -4.5), (0.0, 0.0), (3.5, 2.0)], 1.8);
         }
+        Glyph::Tray => {
+            line(p, &[(-7.0, 0.0), (-7.0, 6.0), (7.0, 6.0), (7.0, 0.0)], 1.8);
+            line(p, &[(0.0, -8.0), (0.0, 2.0)], 1.8);
+            line(p, &[(-3.5, -1.5), (0.0, 2.0), (3.5, -1.5)], 1.8);
+        }
+        Glyph::Columns => {
+            for x in [-8.5, -2.5, 3.5] {
+                rect(p, x, -5.5, 5.0, 11.0, 1.4);
+            }
+        }
     }
 }
 
@@ -871,10 +1137,41 @@ mod tests {
             let x = seg.x + (i as f32 + 0.5) * SEGMENT_W;
             assert_eq!(hit(Pane::Notch, (x, seg.y + 10.0)), Some(Hit::Segment(Control::Width, i)));
         }
+        let seg = control_rect(Pane::Notch, Control::OpenSize).unwrap();
+        for i in 0..3 {
+            let x = seg.x + (i as f32 + 0.5) * SEGMENT_W;
+            assert_eq!(hit(Pane::Notch, (x, seg.y + 10.0)), Some(Hit::Segment(Control::OpenSize, i)));
+        }
+        // The Plugins row toggles, except on its Open Folder button.
+        let plugins = super::row(Pane::General, Control::Plugins).unwrap();
+        assert_eq!(hit(Pane::General, (plugins.x + 30.0, plugins.y + 10.0)), Some(Hit::Control(Control::Plugins)));
+        let folder = control_rect(Pane::General, Control::PluginsFolder).unwrap();
+        let inside = (folder.x + folder.w / 2.0, folder.y + folder.h / 2.0);
+        assert_eq!(hit(Pane::General, inside), Some(Hit::Control(Control::PluginsFolder)));
         // Controls of other panes are not there.
         let reset = control_rect(Pane::General, Control::Reset).unwrap();
         assert_eq!(hit(Pane::General, (reset.x + 5.0, reset.y + 5.0)), Some(Hit::Control(Control::Reset)));
         assert_eq!(control_rect(Pane::Alerts, Control::Reset), None);
+    }
+
+    #[test]
+    fn reorders_pages() {
+        let order = [Page::Shelf, Page::Player, Page::Controls];
+        // Dragged down past the middle of the last row.
+        assert_eq!(reorder(order, Page::Shelf, 1.6), [Page::Player, Page::Controls, Page::Shelf]);
+        // Not far enough: back in place.
+        assert_eq!(reorder(order, Page::Shelf, 0.4), order);
+        // Up to the top, and past the ends.
+        assert_eq!(reorder(order, Page::Controls, 0.2), [Page::Controls, Page::Shelf, Page::Player]);
+        assert_eq!(reorder(order, Page::Player, -0.35), [Page::Player, Page::Shelf, Page::Controls]);
+        assert_eq!(reorder(order, Page::Player, 2.35), [Page::Shelf, Page::Controls, Page::Player]);
+        // A page row is hit by its whole row; Opens To is its pop-up.
+        for i in 0..3 {
+            let r = row(Pane::Layout, Control::PageRow(i)).unwrap();
+            assert_eq!(hit(Pane::Layout, (r.x + 40.0, r.y + 10.0)), Some(Hit::Control(Control::PageRow(i))));
+        }
+        let popup = control_rect(Pane::Layout, Control::StartPage).unwrap();
+        assert_eq!(hit(Pane::Layout, (popup.x + 10.0, popup.y + 10.0)), Some(Hit::Control(Control::StartPage)));
     }
 
     #[test]
@@ -909,10 +1206,13 @@ mod tests {
                     theme: Theme::Dark,
                     pane,
                     settings,
-                    switches: [t; 6],
+                    switches: [t; SWITCHES],
                     width_selection: t * 3.0,
+                    open_size_selection: t * 2.0,
                     duration_selection: t * 2.0,
                     preview_width: 190.0 + 120.0 * t,
+                    page_rows: [0.0, 1.0, 2.0],
+                    page_dragging: None,
                     battery: Some(Battery { percent: 76, plugged: false, charging: false }),
                     time: "9:41".into(),
                     focus: None,
@@ -944,10 +1244,13 @@ mod tests {
                     theme,
                     pane,
                     settings,
-                    switches: [1.0, 1.0, 1.0, 1.0, 0.0, 1.0],
+                    switches: [1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0],
                     width_selection: 1.0,
+                    open_size_selection: 1.0,
                     duration_selection: 1.0,
                     preview_width: preview_width(settings, true),
+                    page_rows: [0.0, 1.0, 2.0],
+                    page_dragging: None,
                     battery,
                     time: "9:41".into(),
                     focus: (pane == Pane::Notch).then_some(Control::Width),
@@ -958,6 +1261,30 @@ mod tests {
                 let name = format!("settings_{}_{:?}.png", pane.title().to_lowercase(), theme).to_lowercase();
                 pixmap.save_png(format!("{}/target/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap();
             }
+            // Now Playing being dragged below Control Center, which makes room.
+            let scale = 2.0;
+            let mut cache = PreviewCache::default();
+            let mut pixmap = Pixmap::new((WIDTH * scale) as u32, (HEIGHT * scale) as u32).unwrap();
+            let view = View {
+                theme,
+                pane: Pane::Layout,
+                settings,
+                switches: [0.0; SWITCHES],
+                width_selection: 1.0,
+                open_size_selection: 1.0,
+                duration_selection: 1.0,
+                preview_width: preview_width(settings, true),
+                page_rows: [0.0, 1.6, 1.2],
+                page_dragging: Some(Page::Player),
+                battery,
+                time: "9:41".into(),
+                focus: None,
+                hover: None,
+                pressed: None,
+            };
+            draw(&mut pixmap, scale, &fonts, &view, &mut cache);
+            let name = format!("settings_layout_dragging_{theme:?}.png").to_lowercase();
+            pixmap.save_png(format!("{}/target/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap();
         }
     }
 }

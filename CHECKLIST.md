@@ -142,6 +142,146 @@ Sebelum mulai satu item, cek dulu apakah API-nya jalan di aplikasi
 - [ ] **Multi-monitor**: pilih monitor notch, atau ikut monitor jendela aktif.
       Sekarang `relayout` selalu memakai monitor utama.
 
+- [x] **Modul Now Playing di Control Center membuka halaman player**
+      (2026-10-31), seperti di iPhone: klik di modul (kecuali tombol
+      play/pause, yang tetap play/pause) menggeser notch ke halaman Now
+      Playing, di slot mana pun halaman itu (Layout). Hanya bila ada media;
+      tanpa media klik tidak berbuat apa-apa. Diuji:
+      `now_playing_module_opens_the_player`; di notch nyata (urutan CC →
+      Shelf → Now Playing, lagu diputar): klik modul → meluncur ke Now
+      Playing dengan lirik.
+
+- [x] **Layout: urutan halaman + halaman pembuka** (2026-10-31). Settings →
+      **Layout**, seperti mengatur halaman Home Screen iPhone (versi pertama
+      berupa daftar dengan pegangan ≡ diganti atas permintaan pengguna:
+      "jelek"). Halaman tampil sebagai **kartu** di atas wallpaper, tiap kartu
+      sketsa isi halamannya (cover + kontrol; tombol bulat + slider; file +
+      zona drop). **Seret kartu ke kiri/kanan** untuk mengurutkan: kartu
+      terangkat (1,07x, bayangan), kartu lain bergeser dengan pegas. **Klik
+      kartu** = halaman pembuka (cincin aksen + lencana "Opens first",
+      titik halaman ala iPhone di bawah). Pop-up *Opens to* tetap ada.
+      Keyboard: Tab ke kartu, ←/→ memindah, Spasi memilih pembuka.
+      Tersimpan: `PageOrder` (halaman per 4 bit, hanya permutasi valid) dan
+      `StartPage`. Baru juga: `notch-woy.exe --settings` membuka Settings
+      langsung.
+      | Pilihan | Dipakai | Alasan |
+      |---|---|---|
+      | Daftar dengan pegangan (versi 1) | tidak | bukan cara iPhone; pengguna menolak |
+      | **Kartu yang diseret langsung** | ya | pola Home Screen / Control Center iOS |
+      | Halaman pembuka: segmen vs pop-up vs klik kartu | **klik kartu** (+ pop-up) | langsung pada benda yang dimaksud; pop-up untuk keyboard |
+      Notch: posisi tetap shelf=-100/player=0/CC=100 diganti **slot**
+      (`App::slot`, `render::slot_of`): gambar per slot dengan lebar
+      masing-masing, lebar notch diinterpolasi antar slot, gradien cover
+      menurut jarak ke slot player, deteksi halaman, drop file → slot shelf,
+      notch dibuka di halaman pembuka; mengubah urutan saat terbuka
+      mempertahankan halaman yang tampil.
+      Diuji: `bad_stored_values_fall_back`, `round_trips_through_bits`,
+      `reorders_pages`, `everything_fits_the_window`, pratinjau
+      `preview_order_*.png`, `settings_layout_*.png`; di notch nyata (urutan
+      CC → Now Playing → Shelf): terbuka di CC dan geser sesuai urutan; di
+      jendela Settings nyata (dibuka dengan `--settings`, input berupa pesan
+      mouse ke jendela): seret kartu pertama dua tempat ke kanan → PageOrder
+      258 → 528 (benar), klik kartu tengah → StartPage Now Playing. Setelan
+      pengguna dikembalikan setelah tiap uji.
+      Insiden uji: percobaan membuka Settings lewat menu tray dengan tombol ↓
+      dan Enter sintetis gagal (menu tidak mendapat fokus); tombol itu
+      mungkin masuk ke jendela aktif pengguna (VS Code). Dilaporkan ke
+      pengguna; uji berikutnya tanpa keyboard.
+
+- [x] **Kecerahan per layar (monitor eksternal)** (2026-10-30). Slider
+      kecerahan Control Center tetap mengatur semua layar; bila ada 2+ layar,
+      simbolnya berganti jadi dua layar dan membuka sheet **Displays** (seperti
+      modul Display di Control Center Mac): tumbuh dari slider, satu baris per
+      layar (ikon laptop/monitor, nama dari Windows, persen, slider
+      horizontal sendiri). Ketuk di luar sheet untuk menutup; roda/geser
+      halaman ditahan selama sheet terbuka; tertutup saat notch menutup,
+      pindah halaman, atau tinggal satu layar.
+      | Pilihan | Dipakai | Alasan |
+      |---|---|---|
+      | Slider vertikal tambahan per layar | tidak | Control Center penuh; modul kanan jadi terlalu sempit |
+      | Tekan-tahan slider (iOS) | tidak | dengan mouse tidak lazim dan sulit ditemukan; ketuk slider sudah dipakai untuk mengatur nilai |
+      | **Simbol dua layar di kaki slider → sheet** | ya | terlihat, satu ketuk, pola sheet yang sama dengan pemilih output |
+      Nama monitor: DisplayConfig (`QueryDisplayConfig` +
+      `DisplayConfigGetDeviceInfo`, nama yang sama dengan Settings > Display),
+      dicocokkan lewat nama perangkat GDI (`GetMonitorInfoW`). Level monitor
+      eksternal dibaca saat ditemukan/refresh lalu disimpan setelah diatur
+      (DDC/CI lambat, tidak dibaca tiap langkah drag); perintah per layar
+      digabung per batch (yang terakhir per layar). Diuji: `displays_hit_testing`;
+      di notch nyata (layar laptop + Mi Monitor, ukuran Large): sheet terbuka
+      dengan nama dan level yang benar, lalu tertutup tanpa perintah
+      kecerahan (diverifikasi dengan log). Catatan: satu uji awal saya
+      mengenai slider Mi Monitor karena koordinat dihitung untuk ukuran
+      Normal (pengguna memakai Large) → 50%; dikembalikan ke 100%.
+
+- [x] **Bug: cover lagu dari browser kadang ikon Brave** (2026-10-30,
+      `media.rs`). Penyebab: (1) cover di-decode sekali per lagu (judul +
+      artis) lalu dipakai terus; browser Chromium (Brave, Chrome, Edge)
+      mengumumkan judul baru lebih dulu dengan thumbnail ikon browser atau
+      cover lagu sebelumnya, artwork asli menyusul; (2) `same_as` hanya
+      membandingkan ada/tidaknya cover, jadi koreksi cover tidak pernah
+      dikirim ke notch.
+      | Pilihan | Dipakai | Alasan |
+      |---|---|---|
+      | Deteksi ikon browser (transparansi) | tidak | tebakan; tidak menangani cover lagu sebelumnya |
+      | Decode ulang tiap poll | tidak | decode terus sepanjang lagu |
+      | **Event `MediaPropertiesChanged`** + baca ulang 4 s setelah ganti lagu | ya | baca ulang hanya saat player bilang berubah; jendela 4 s untuk player yang tidak mengirim event |
+      Handler dipasang di sesi aktif dan dipindah saat sesi berganti
+      (identitas COM `IUnknown`). Cover yang dibaca ulang dan sama persis
+      (isi piksel) tetap `Arc` yang sama: tidak ada crossfade palsu; yang
+      berbeda menggantikan, termasuk di alert lagu baru yang sedang tampil
+      (`announce_track`). Thumbnail yang sesaat tidak ada tidak menghapus
+      cover yang sudah tampil. Diuji: `notices_corrected_art`. Belum diuji
+      dengan ganti lagu sungguhan di Brave (tidak mengubah musik pengguna).
+
+- [x] **Animasi mulus mengikuti Hz layar + memori** (2026-10-30). Diukur
+      dulu (profil frame sementara, layar 180 Hz = anggaran 5,5 ms/frame):
+      kerja render kecil, tapi ada **jeda 46–61 ms** berkala dan frame
+      melebihi anggaran saat ukuran berubah (p95 jeda 11 ms).
+      | Penyebab (terukur) | Perbaikan | Hasil |
+      |---|---|---|
+      | `Meter::read` menanyakan perangkat audio default tiap 1 s (RPC ke layanan audio) di thread UI: `tick` 22–24 ms | meter mengikuti notifikasi ganti perangkat `volume.rs` (`DEFAULT_DEVICE_GENERATION`), aktivasi saat start | jeda 46–61 ms hilang |
+      | Ikon speaker gelap: pixmap seukuran kanvas dialokasikan, di-loop, dan dikomposit **tiap frame** | digambar langsung berwarna (`speaker_icon_in`) | Control Center 2,5 → 1,5 ms |
+      | Bayangan dihitung per piksel tiap frame saat ukuran berubah | setengah kolom + cermin, baris lurus dihitung sekali | 1,3–1,6 → 0,5–0,6 ms |
+      | `fill_within` memproses & mengalokasikan mask seluruh kanvas | mask dipakai ulang, gabung clip hanya di kotak batas | slider/progress murah |
+      | Equalizer & lirik per kata pakai `SetTimer` 33 ms (meleset 8–38 ms) | frame vsync dengan pembagi `round(Hz/60)` (`DwmGetCompositionTimingInfo`; 180 Hz → tiap 3 refresh = 60 fps), hanya `redraw` | gerak rata, sinkron layar |
+      Sesudah: p95 jeda 5,9–6,2 ms (tiap vsync 180 Hz), sesekali satu vsync
+      terlewat (maks ~11 ms), tanpa jeda besar; frame terberat ~3–5 ms.
+      Render identik (pratinjau dibandingkan per piksel: sama / selisih
+      ≤ 2/255). Memori: tak ada lagi alokasi 528 KB per frame; mask scratch
+      dilepas saat trim (`render::release_scratch`); diam 45 s setelah start:
+      3,3 MB "Memory" (sama dengan sebelum fitur-fitur baru), private bytes
+      12,8 MB. CPU diam (pill mini, tanpa frame) ~1,7% satu core dari worker
+      polling (media, notifikasi, Bluetooth). Belum terlihat langsung:
+      equalizer 60 fps di notch diam (saat uji: pill mini) dan lirik per kata
+      (lagu dijeda); `ambient_frames_follow_the_display` memastikan pembagi 3
+      di layar ini.
+  - [ ] Lanjutan: cache layer per halaman (Control Center ~1,5 ms masih
+        terbesar) bila perlu di layar 240 Hz+; kurangi polling worker
+        (notifikasi 0,7 s) dengan event bila API mengizinkan.
+
+- [x] **Ukuran notch saat di-hover bisa diatur** (2026-10-30). Settings →
+      Notch → *Open size*: Compact (0,9x), Normal, Large (1,1x); tersimpan
+      sebagai DWORD `OpenSize` (Normal = 0, Compact = 1, Large = 2), ikut
+      `to_bits` (bit 24; menit Bluetooth kini 8 bit, maks 60).
+      | Pilihan | Dipakai | Alasan |
+      |---|---|---|
+      | Tata ulang tiap halaman per ukuran vs skala seluruh notch terbuka | **skala** (`open_zoom`) | satu titik perubahan; isi tetap proporsional; hit-test cukup memakai skala yang sama |
+      | Atur lebar/tinggi terpisah vs satu ukuran | **satu ukuran** | lebar sudah per halaman dan per isi (shelf), tinggi ditentukan isi; skala menjaga keduanya |
+      | Rentang lebih besar (1,25x) vs 1,1x | **1,1x** | 1,25x butuh kanvas ~720 px untuk Control Center; 1,1x cukup dengan kanvas 600 → 660 (+~10% piksel kanvas) |
+      Ikut diskalakan: bentuk & bayangan (`expansion`/`draw_shadow` dengan
+      zoom), semua hit-test (tombol, progress, lirik, Control Center,
+      slider, daftar output, shelf), titik awal file yang terbang ke shelf,
+      jangkar share sheet, dan resolusi thumbnail shelf (dibuat ulang saat
+      setelan berubah). Baris Settings Notch kini 50 px agar empat baris
+      muat (`everything_fits_the_window`).
+      Diuji: `bad_stored_values_fall_back`, `round_trips_through_bits`,
+      `hits_match_drawn_controls` (segmen Open size); pratinjau
+      `preview_open_compact/large.png`, `settings_notch_*.png`; di notch
+      nyata dengan Large (registry sementara, lalu dikembalikan): player
+      572 px dan Control Center 616 px, utuh dalam kanvas.
+      Catatan: pratinjau di jendela Settings masih menampilkan notch diam
+      saja, belum ukuran terbuka.
+
 - [x] **Lirik per kata + font lagu lebih tebal** (2026-10-30).
       Lirik: baris yang sedang dinyanyikan menyala huruf demi huruf seperti
       Apple Music (bagian yang belum: 30% antara redup dan putih; tepi
@@ -306,6 +446,28 @@ Sebelum mulai satu item, cek dulu apakah API-nya jalan di aplikasi
           riak, 900 ms selesai. Referensi: Apple Developer, [Drag and drop
           (UIKit)](https://developer.apple.com/documentation/uikit/drag-and-drop),
           [UIDropInteractionDelegate](https://developer.apple.com/documentation/uikit/uidropinteractiondelegate).
+    - [x] **Clear All + animasi "terbuang"** (2026-10-30). Tombol tempat
+          sampah bulat diganti pil **Clear All** (ikon + teks) yang jelas.
+          Menghapus (× per file atau Clear All) meniru *Move to Trash* di Mac:
+          ikon sedikit terangkat, lalu terlempar dalam lengkung (Bezier naik
+          di atas shelf lalu turun) ke tempat sampah di tombol itu, mengecil
+          ke 15% dan miring 28°, memudar di 20% akhir (0,55 s). Tutup tempat
+          sampah terbuka saat ikon mendekat lalu menutup dengan pantulan,
+          dan tempat sampah membesar sejenak saat "menelan" (0,3 s). Per
+          file: semua ubin meluncur dari tata letak lama ke yang baru
+          (0,32 s), termasuk pergeseran pusat deretan. Clear All: file
+          terlempar bergantian kiri ke kanan (selang 0,06 s), tombol memudar
+          setelah file terakhir masuk, lalu zona drop kosong muncul.
+          | Pilihan | Dipakai | Alasan |
+          |---|---|---|
+          | Mengecil + memudar di tempat (iOS hapus item) vs terlempar ke tempat sampah (macOS Trash) | **terlempar** | permintaan "seperti terbuang"; tujuan terlihat (tombol yang diklik) |
+          | Jalur lurus vs lengkung | **lengkung** | gerak lempar alami, melewati tombol share |
+          | Konfirmasi sebelum Clear All | **tidak** | hanya referensi yang dihapus, file tetap ada |
+          Diuji nyata (3 file uji): × → ikon terlempar berputar ke tempat
+          sampah (230 ms), masuk lewat tutup terbuka (420 ms); Clear All →
+          semua terlempar, zona kosong muncul. Shelf pengguna dikembalikan
+          (sudah kosong sebelum uji). Pratinjau: `preview_shelf_remove_*.png`,
+          `preview_shelf_clear_*.png`.
 - [x] **Visualizer dari audio asli** (2026-10-30, `meter.rs`). Equalizer
       notch diam (3 bar) dan alert lagu baru (4 bar) kini mengikuti suara
       yang keluar dari perangkat output default.
@@ -359,8 +521,39 @@ Sebelum mulai satu item, cek dulu apakah API-nya jalan di aplikasi
       jika opsional.
 - [ ] **Gesture yang bisa diatur** (roadmap boring.notch), mis. swipe
       horizontal untuk next/previous lagu.
-- [ ] **Ekstensi / plugin** (roadmap boring.notch): baru masuk akal setelah
-      pengaturan ada.
+- [x] **Ekstensi / plugin** (2026-10-30, `plugins.rs`). Riset: boring.notch
+      baru punya "Extension system" sebagai rencana di roadmap (tanpa
+      desain); DynamicWin tidak punya API plugin (repo hanya rilis);
+      xbar/SwiftBar punya sistem plugin matang berbasis script.
+      | Model | Bahasa | Risiko | Biaya |
+      |---|---|---|---|
+      | DLL (ABI C) | Rust/C | plugin crash = notch crash, ABI rapuh | kecil |
+      | WASM (wasmtime) | banyak | aman (sandbox) | dependensi besar, RAM +10 MB lebih |
+      | Lua tertanam | Lua | sedang | dependensi baru, API dirancang sendiri |
+      | **Proses script (xbar/SwiftBar)** | apa saja | terisolasi per proses | **tanpa dependensi**, hanya jalan sesuai jadwal |
+      Dipilih model xbar/SwiftBar (subset format-nya): file
+      `{nama}.{interval}.{ext}` di `%LOCALAPPDATA%\notch-woy\plugins`
+      (`.ps1`, `.cmd`/`.bat`, `.py` lewat `python.exe`, `.exe`; interval
+      `s/m/h/d`, minimal 5 s, default 1 m). Output: baris pertama sebelum
+      `---` = judul, opsional `| href=...`; baris pertama setelah `---` =
+      isi; UTF-8 atau code page konsol. Judul berubah → alert seperti
+      notifikasi (nama plugin, judul, isi); klik membuka `href`. Run pertama
+      hanya mencatat (tidak ada alert saat notch baru jalan). Proses tanpa
+      jendela (`CREATE_NO_WINDOW`), stdout dibaca di thread terpisah (maks
+      64 KB), dihentikan setelah 10 s, exit ≠ 0 diabaikan; env
+      `NOTCH_WOY=1`, `NOTCH_WOY_PLUGINS_PATH`, `NOTCH_WOY_PLUGIN_PATH`.
+      File baru/diubah langsung dijalankan (folder dipindai tiap 5 s).
+      Settings → General: sakelar **Plugins** (default **mati**: tidak ada
+      script yang jalan tanpa diminta) dan tombol **Open Folder**.
+      Diuji: `reads_file_names`, `reads_swiftbar_output`,
+      `decodes_console_output`, `runs_a_plugin` (PowerShell nyata + cmd
+      yang gagal), `hits_match_drawn_controls` (baris Plugins vs tombol
+      folder); di notch nyata: `tick.5s.ps1` memunculkan alert "tick /
+      Tick 358675170" lalu "…172"; semua dibersihkan sesudahnya. Belum
+      diuji: klik alert membuka `href` (akan membuka browser pengguna).
+  - [ ] Lanjutan plugin: tampilan menetap (bukan hanya alert), mis. baris
+        di Control Center atau halaman sendiri; menu (`---` body) seperti
+        SwiftBar; plugin streaming (proses jalan terus, pembaruan `~~~`).
 
 ### Tidak cocok untuk Windows
 

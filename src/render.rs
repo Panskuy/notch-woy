@@ -16,12 +16,13 @@ use tiny_skia::{
 use crate::anim::{ease_out_back, ease_out_cubic};
 use crate::battery::{Battery, BatteryEvent};
 use crate::bluetooth::{Device, DeviceKind};
-use crate::controls::ControlState;
+use crate::controls::{ControlState, DisplayLevel};
 use crate::lyrics::Line;
 use crate::media::{art_changed, track_changed, Command, NowPlaying};
 use crate::notifications::Toast;
 use crate::outputs::{Output, OutputKind};
 use crate::palette::Rgb;
+use crate::settings::Page;
 use crate::shelf::{self, Item};
 
 /// Notch size. The top edge sits flush with the screen.
@@ -257,6 +258,12 @@ pub struct Scene<'a> {
     /// The equalizers' bar heights (0..1) from the output's peak meter;
     /// `None` and they animate on their own.
     pub levels: Option<[f32; crate::meter::BARS]>,
+    /// Scale of the open notch (the Open size setting): its shape, from
+    /// the window, and everything drawn on it, here. 1 is as designed.
+    pub open_zoom: f32,
+    /// The open notch's pages, left to right (the Layout setting): `page`
+    /// -1, 0 and 1.
+    pub page_order: [Page; 3],
     /// The time of day, as Windows formats it (no seconds, no AM/PM), shown
     /// on the left of the resting notch like the iPhone's status bar.
     pub time: &'a str,
@@ -276,7 +283,54 @@ pub struct ShelfView<'a> {
     /// How far the drop zone has lit up for files dragged over it, 0..1
     /// (a spring: a little past 1 as it pops).
     pub drop_glow: f32,
+    /// Files just dropped: how many (the first tiles), and seconds since.
     pub arrival: Option<Arrival>,
+    /// Files just taken off the shelf, on their way into the bin.
+    pub departures: &'a [Departure],
+    /// A file was taken off at this index this many seconds ago: the tiles
+    /// after it slide over to close the gap.
+    pub closing: Option<(usize, f32)>,
+}
+
+/// A file taken off the shelf: its icon, thrown from its tile into the
+/// Clear All button's bin, like a file dragged to the Trash on a Mac.
+#[derive(Clone)]
+pub struct Departure {
+    pub icon: Option<Arc<Pixmap>>,
+    /// Where its icon's center was (the shelf page's layout units).
+    pub from: (f32, f32),
+    /// Seconds since it was thrown; negative while it waits its turn (a
+    /// Clear All throws them one after another).
+    pub t: f32,
+}
+
+/// Seconds a thrown file takes to reach the bin.
+const THROW: f32 = 0.55;
+/// Between files thrown by Clear All.
+pub const THROW_STAGGER: f32 = 0.06;
+/// After a file lands: the lid closes and the bin gulps, this long.
+const GULP: f32 = 0.3;
+/// Seconds the tiles after a removed one take to close the gap.
+const CLOSE_GAP: f32 = 0.32;
+
+/// Seconds a thrown file stays on screen (flight, then the bin's gulp).
+pub fn shelf_throw_length() -> f32 {
+    THROW + GULP
+}
+
+/// Seconds the gap left by a removed file takes to close.
+pub fn shelf_close_length() -> f32 {
+    CLOSE_GAP
+}
+
+/// Where the icon of the file at `index` is drawn on the shelf page
+/// (layout units), with `count` files scrolled to `scroll`; `None` when it
+/// is scrolled out of sight.
+pub fn shelf_icon_center(canvas_width: u32, scale: f32, count: usize, scroll: f32, index: usize) -> Option<(f32, f32)> {
+    let g = ShelfGeometry::new(canvas_width as f32 / scale, count);
+    let x = g.tile_x(index, scroll);
+    let (x0, x1) = g.strip();
+    (x + SHELF_TILE_W > x0 && x < x1).then_some((x + SHELF_TILE_W / 2.0, SHELF_ICON_Y + shelf::ICON / 2.0))
 }
 
 /// Files just dropped on the shelf.
@@ -413,6 +467,24 @@ pub struct ControlsView<'a> {
     pub toggle_on: [f32; 4],
     /// Per toggle, its size (1 at rest, smaller while pressed).
     pub toggle_scale: [f32; 4],
+    /// The screens whose brightness can be set, each on its own slider in
+    /// the Displays sheet; with two or more, the brightness slider's symbol
+    /// becomes a pair of screens that opens it.
+    pub displays: &'a [DisplayLevel],
+    /// How far the Displays sheet is open, 0..1 (a spring: a little past 1
+    /// as it pops).
+    pub displays_reveal: f32,
+    /// A screen's slider being dragged, with its value (0..1).
+    pub display_drag: Option<(usize, f32)>,
+}
+
+/// What is under the pointer on the open Displays sheet.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DisplayHit {
+    /// A screen's slider, with the value (0..1) at the pointer.
+    Slider(usize, f32),
+    /// On the sheet, off the sliders.
+    Sheet,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -456,6 +528,12 @@ pub enum ControlHit {
     Slider(Slider, f32),
     /// The play/pause button on the Now Playing module.
     PlayPause,
+    /// The brightness slider's screens symbol (two or more screens): opens
+    /// the Displays sheet.
+    Displays,
+    /// The Now Playing module, off its play/pause button: goes to the
+    /// player's page.
+    NowPlaying,
 }
 
 /// A brief notification, shown in its `alert_shape`.
@@ -580,9 +658,22 @@ fn presence_changed(a: Option<&NowPlaying>, b: Option<&NowPlaying>) -> bool {
     a.is_some() != b.is_some()
 }
 
-/// How far the notch is between collapsed (0) and expanded (1).
-fn expansion(shape: Shape) -> f32 {
-    ((shape.height - COLLAPSED.height) / (EXPANDED.height - COLLAPSED.height)).clamp(0.0, 1.0)
+thread_local! {
+    /// A canvas-sized mask reused by `Canvas::fill_within` frame after
+    /// frame, rather than allocated for every slider.
+    static SCRATCH_MASK: RefCell<Option<Mask>> = const { RefCell::new(None) };
+}
+
+/// Frees what drawing keeps between frames for speed, while the notch is
+/// at rest (`window::trim_working_set`); it comes back on the next frame.
+pub fn release_scratch() {
+    SCRATCH_MASK.with_borrow_mut(|slot| *slot = None);
+}
+
+/// How far the notch is between collapsed (0) and expanded (1), for an
+/// open notch scaled by `zoom`.
+fn expansion(shape: Shape, zoom: f32) -> f32 {
+    ((shape.height - COLLAPSED.height) / (EXPANDED.height * zoom - COLLAPSED.height)).clamp(0.0, 1.0)
 }
 
 /// Room the shadow's canvas has beyond the notch's on the left, right and
@@ -593,9 +684,9 @@ pub const SHADOW_PAD: f32 = 40.0;
 /// Wide, faint shadow around the open notch, centered on a canvas
 /// `SHADOW_PAD` larger than the notch's. It deepens as the notch opens;
 /// returns false when there is none (the notch is at rest).
-pub fn draw_shadow(pixmap: &mut Pixmap, scale: f32, shape: Shape) -> bool {
+pub fn draw_shadow(pixmap: &mut Pixmap, scale: f32, shape: Shape, zoom: f32) -> bool {
     pixmap.fill(Color::TRANSPARENT);
-    let t = expansion(shape);
+    let t = expansion(shape, zoom);
     if t <= 0.0 {
         return false;
     }
@@ -617,17 +708,42 @@ pub fn draw_shadow(pixmap: &mut Pixmap, scale: f32, shape: Shape) -> bool {
     let x0 = (((cx - half_w - BLUR) * scale).floor().max(0.0)) as usize;
     let x1 = (((cx + half_w + BLUR) * scale).ceil() as usize).min(pw);
     let y1 = (((bottom + BLUR) * scale).ceil() as usize).min(ph);
+    let alpha_at = |px: usize, qy: f32| {
+        let qx = ((px as f32 + 0.5) / scale - cx).abs() - half_w + r;
+        let outside = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r;
+        let u = (outside / BLUR).clamp(0.0, 1.0);
+        // Fades fast near the notch, then trails off far and faint.
+        (peak * (1.0 - u).powi(2) * 255.0).round() as u8
+    };
+    // The shadow is symmetric about the canvas's middle: the left half is
+    // worked out and mirrored. Rows level with the notch's straight sides
+    // (above its rounded bottom corners) only differ across, so one is
+    // worked out and copied down. This runs every frame the notch changes
+    // size; a few hundred thousand pixel distances were too many for a
+    // 180 Hz frame.
+    let half = pw.div_ceil(2).min(x1).max(x0);
+    let fill_row = |row: &mut [u8], qy: f32| {
+        for px in x0..half {
+            let a = alpha_at(px, qy);
+            row[px] = a;
+            row[pw - 1 - px] = a;
+        }
+    };
+    let (mut straight, mut curved) = (vec![0u8; pw], vec![0u8; pw]);
+    fill_row(&mut straight, 0.0);
     let data = pixmap.data_mut();
     for py in 0..y1 {
         let qy = ((py as f32 + 0.5) / scale - cy).abs() - half_h + r;
+        let row = if qy <= 0.0 {
+            &straight
+        } else {
+            fill_row(&mut curved, qy);
+            &curved
+        };
+        // Black, premultiplied: only alpha is set.
+        let line = &mut data[py * pw * 4..(py + 1) * pw * 4];
         for px in x0..x1 {
-            let qx = ((px as f32 + 0.5) / scale - cx).abs() - half_w + r;
-            let outside = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r;
-            let u = (outside / BLUR).clamp(0.0, 1.0);
-            // Fades fast near the notch, then trails off far and faint.
-            let alpha = peak * (1.0 - u).powi(2);
-            // Black, premultiplied: only alpha is set.
-            data[(py * pw + px) * 4 + 3] = (alpha * 255.0).round() as u8;
+            line[px * 4 + 3] = row[px];
         }
     }
     true
@@ -667,9 +783,10 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
 
     // The open notch's content and gradient; an alert tall enough to reach
     // into its range (a notification card) keeps them hidden.
-    let t = expansion(shape);
+    let zoom = scene.open_zoom;
+    let t = expansion(shape, zoom);
     let expanded_alpha = ((t - 0.35) / 0.65).clamp(0.0, 1.0) * (1.0 - alert_alpha);
-    // -1 shelf, 0 player, 1 Control Center.
+    // -1 left, 0 middle, 1 right; which page is where is `page_order`.
     let page = scene.page.clamp(-1.0, 1.0);
     // The cover gradient comes with the lyrics panel. It is the backdrop of
     // the whole open notch, not of the player page: it stays put while the
@@ -678,7 +795,8 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
     // its color.
     // The output picker covers the player, gradient and all.
     let picker = scene.outputs.reveal.clamp(0.0, 1.0);
-    let side = page.abs();
+    // How far the view is from the player's page.
+    let side = (page - slot_of(scene.page_order, Page::Player)).abs().min(1.0);
     let backdrop = 1.0 - (1.0 - SIDE_PAGE_TINT) * side;
     let gradient_alpha =
         expanded_alpha * scene.lyrics_reveal.clamp(0.0, 1.0) * (1.0 - picker * (1.0 - side)) * backdrop;
@@ -719,20 +837,29 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
     }
 
     if expanded_alpha > 0.0 {
+        // The open notch is laid out at its designed size and drawn scaled:
+        // in its own units the canvas is narrower (or wider) by the zoom.
+        canvas.scale = scale * zoom;
+        let canvas_w = canvas_w / zoom;
         let layout = Layout::new(canvas_w, scene.panel_width, scene.lyrics_reveal);
-        // Pages sit side by side, edge to edge, the shelf on the left, the
-        // player in the middle, Control Center on the right, each centered
-        // and as wide as it needs; they slide as one while the notch's width
-        // follows, its edge cutting them off; no fading. Positions follow
-        // the raw value, which a touchpad can stretch a little past either
-        // end (rubber band).
+        // Pages sit side by side, edge to edge, in the order of the Layout
+        // setting, each centered and as wide as it needs; they slide as one
+        // while the notch's width follows, its edge cutting them off; no
+        // fading. Positions follow the raw value, which a touchpad can
+        // stretch a little past either end (rubber band).
         let raw = scene.page;
-        let controls_x = (layout.width + CONTROLS_WIDTH) / 2.0;
-        let shelf_x = -(layout.width + shelf_width(scene.shelf.items.len())) / 2.0;
-        let view = if raw >= 0.0 { raw * controls_x } else { -raw * shelf_x };
-        if raw < 1.0 && raw > -1.0 {
+        let widths = scene.page_order.map(|p| page_width(p, layout.width, scene.shelf.items.len()));
+        // Centers of the left, middle and right pages, the middle at 0.
+        let centers = [-(widths[0] + widths[1]) / 2.0, 0.0, (widths[1] + widths[2]) / 2.0];
+        let view = if raw >= 0.0 { raw * centers[2] } else { -raw * centers[0] };
+        let at = |page: Page| {
+            let slot = scene.page_order.iter().position(|&p| p == page).unwrap_or(1);
+            let shown = (raw - (slot as f32 - 1.0)).abs() < 1.0;
+            shown.then_some(centers[slot] - view)
+        };
+        if let Some(dx) = at(Page::Player) {
             let a = expanded_alpha;
-            canvas.dx = -view;
+            canvas.dx = dx;
             // The player dims away behind the sheet growing over it.
             let fade = (1.0 - picker * 1.3).clamp(0.0, 1.0);
             if fade > 0.0 {
@@ -742,13 +869,13 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
                 canvas.output_picker(&scene.outputs, layout, a);
             }
         }
-        if raw > 0.0 {
-            canvas.dx = controls_x - view;
+        if let Some(dx) = at(Page::Controls) {
+            canvas.dx = dx;
             let left = (canvas_w - CONTROLS_WIDTH) / 2.0;
             canvas.control_center(&scene.controls, left, CONTROLS_WIDTH, expanded_alpha);
         }
-        if raw < 0.0 {
-            canvas.dx = shelf_x - view;
+        if let Some(dx) = at(Page::Shelf) {
+            canvas.dx = dx;
             canvas.shelf(&scene.shelf, canvas_w, scene.clock, expanded_alpha);
         }
         canvas.dx = 0.0;
@@ -834,6 +961,26 @@ pub fn button_at(
     .map(|(button, _)| button)
 }
 
+/// The bin's lid (0 shut .. 1 open) and gulp (0..1) while files are thrown
+/// at it: the lid opens as one nears, and when it lands snaps shut while
+/// the bin swells and settles.
+fn bin_motion(departures: &[Departure]) -> (f32, f32) {
+    let (mut lid, mut gulp) = (0.0f32, 0.0f32);
+    for d in departures {
+        let p = d.t / THROW;
+        if (0.3..1.0).contains(&p) {
+            lid = lid.max(((p - 0.3) / 0.35).min(1.0));
+        }
+        let after = (d.t - THROW) / GULP;
+        if (0.0..1.0).contains(&after) {
+            // Shuts fast with a little bounce; the swell rises and falls.
+            lid = lid.max((1.0 - after * 3.0).max(0.0) - 0.15 * (after * 9.0).sin() * (1.0 - after));
+            gulp = gulp.max((std::f32::consts::PI * after).sin());
+        }
+    }
+    (lid.clamp(-0.2, 1.0), gulp)
+}
+
 /// The shelf page's parts, for `count` files in an open notch as wide as
 /// they need (`shelf_width`).
 struct ShelfGeometry {
@@ -851,6 +998,7 @@ const SHELF_TILE_H: f32 = 92.0;
 const SHELF_ICON_Y: f32 = SHELF_TOP + 6.0;
 const SHELF_BUTTON_Y: f32 = 25.0;
 const SHELF_BUTTON_R: f32 = 13.0;
+const SHELF_CLEAR_W: f32 = 86.0;
 
 /// The tile strip's inset from the shelf page's sides.
 const SHELF_PAD: f32 = 18.0;
@@ -869,13 +1017,28 @@ pub fn shelf_width(count: usize) -> f32 {
 /// player, so the Now Playing and Bluetooth modules have room for names.
 pub const CONTROLS_WIDTH: f32 = 560.0;
 
-/// The open notch's width on `page` (-1 shelf, 0 player, 1 Control
-/// Center), for a player `player` wide and `shelf_count` files; between two
+/// The open notch's width for `page` (-1 left, 0 middle, 1 right of
+/// `order`), with a player `player` wide and `shelf_count` files; between two
 /// pages (a touchpad drag) it goes from one width to the other.
-pub fn open_width(player: f32, page: f32, shelf_count: usize) -> f32 {
+pub fn open_width(order: [Page; 3], player: f32, page: f32, shelf_count: usize) -> f32 {
     let page = page.clamp(-1.0, 1.0);
-    let side = if page >= 0.0 { CONTROLS_WIDTH } else { shelf_width(shelf_count) };
-    player + (side - player) * page.abs()
+    let width = |slot: usize| page_width(order[slot], player, shelf_count);
+    let side = if page >= 0.0 { width(2) } else { width(0) };
+    width(1) + (side - width(1)) * page.abs()
+}
+
+/// How wide the open notch is on `page`.
+fn page_width(page: Page, player: f32, shelf_count: usize) -> f32 {
+    match page {
+        Page::Shelf => shelf_width(shelf_count),
+        Page::Player => player,
+        Page::Controls => CONTROLS_WIDTH,
+    }
+}
+
+/// Where `page` sits in `order`: -1 left, 0 middle, 1 right.
+pub fn slot_of(order: [Page; 3], page: Page) -> f32 {
+    order.iter().position(|&p| p == page).map_or(0.0, |i| i as f32 - 1.0)
 }
 
 impl ShelfGeometry {
@@ -906,12 +1069,20 @@ impl ShelfGeometry {
         self.first + (index as f32 - scroll) * SHELF_STEP
     }
 
-    fn share_center(&self) -> (f32, f32) {
-        (self.left + self.width - 68.0, SHELF_BUTTON_Y)
+    /// The Clear All button: a pill with a bin and its label.
+    fn clear_rect(&self) -> Rect {
+        let w = SHELF_CLEAR_W;
+        Rect::from_xywh(self.left + self.width - 22.0 - w, SHELF_BUTTON_Y - SHELF_BUTTON_R, w, 2.0 * SHELF_BUTTON_R)
+            .expect("positive size")
     }
 
-    fn clear_center(&self) -> (f32, f32) {
-        (self.left + self.width - 38.0, SHELF_BUTTON_Y)
+    /// Where the bin is drawn in the Clear All button.
+    fn bin_center(&self) -> (f32, f32) {
+        (self.clear_rect().left() + 16.0, SHELF_BUTTON_Y)
+    }
+
+    fn share_center(&self) -> (f32, f32) {
+        (self.clear_rect().left() - 8.0 - SHELF_BUTTON_R, SHELF_BUTTON_Y)
     }
 
     /// The remove button of a tile at `tile_x`.
@@ -941,7 +1112,8 @@ pub fn shelf_at(
         if near(g.share_center(), SHELF_BUTTON_R) {
             return Some(ShelfHit::Share);
         }
-        if near(g.clear_center(), SHELF_BUTTON_R) {
+        let clear = g.clear_rect();
+        if (clear.left() - 2.0..=clear.right() + 2.0).contains(&x) && (clear.top() - 2.0..=clear.bottom() + 2.0).contains(&y) {
             return Some(ShelfHit::Clear);
         }
     }
@@ -996,6 +1168,15 @@ const SLIDER_W: f32 = 52.0;
 const BRIGHTNESS_X: f32 = 156.0;
 const VOLUME_X: f32 = 220.0;
 const MODULES_X: f32 = 286.0;
+/// The brightness slider's foot that opens the Displays sheet (two or more
+/// screens), measured up from its bottom.
+const SLIDER_SYMBOL_ZONE: f32 = 36.0;
+/// The Displays sheet: its inset in the Control Center, header, and the
+/// height of each screen's row (name above a slider).
+const DISPLAYS_INSET: f32 = 8.0;
+const DISPLAYS_HEADER: f32 = 32.0;
+const DISPLAY_ROW_MAX: f32 = 44.0;
+const DISPLAY_SLIDER_H: f32 = 20.0;
 const MODULE_GAP: f32 = 10.0;
 /// Each of the right-hand rows: Now Playing, then battery + Bluetooth.
 const MODULE_H: f32 = (CC_HEIGHT - MODULE_GAP) / 2.0;
@@ -1061,17 +1242,24 @@ fn lerp_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
 
 /// What on the Control Center page is under a point in physical canvas
 /// pixels.
-pub fn control_at(canvas_width: u32, scale: f32, (x, y): (f32, f32)) -> Option<ControlHit> {
+pub fn control_at(canvas_width: u32, scale: f32, multi: bool, (x, y): (f32, f32)) -> Option<ControlHit> {
     let left = (canvas_width as f32 / scale - CONTROLS_WIDTH) / 2.0;
     let (x, y) = (x / scale - left, y / scale);
+    // With several screens, the symbol at the brightness slider's foot is
+    // a button of its own.
+    let symbol_y = CC_TOP + CC_HEIGHT - SLIDER_SYMBOL_ZONE;
+    if multi && (BRIGHTNESS_X..=BRIGHTNESS_X + SLIDER_W).contains(&x) && (symbol_y..=CC_TOP + CC_HEIGHT).contains(&y) {
+        return Some(ControlHit::Displays);
+    }
     if let Some((toggle, _, _)) = toggles().into_iter().find(|&(_, cx, cy)| (x - cx).hypot(y - cy) <= TOGGLE_RADIUS) {
         return Some(ControlHit::Toggle(toggle));
     }
     let modules_w = modules_width(CONTROLS_WIDTH);
     let media_right = MODULES_X + modules_w;
-    let on_media_button = x >= media_right - MEDIA_BUTTON_W && x <= media_right && y >= CC_TOP && y <= CC_TOP + MODULE_H;
-    if modules_w >= MODULES_MIN_W && on_media_button {
-        return Some(ControlHit::PlayPause);
+    let on_media_row = (CC_TOP..=CC_TOP + MODULE_H).contains(&y);
+    if modules_w >= MODULES_MIN_W && on_media_row && (MODULES_X..=media_right).contains(&x) {
+        let on_button = x >= media_right - MEDIA_BUTTON_W;
+        return Some(if on_button { ControlHit::PlayPause } else { ControlHit::NowPlaying });
     }
     let in_column = |x0: f32| x >= x0 && x <= x0 + SLIDER_W && y >= CC_TOP && y <= CC_TOP + CC_HEIGHT;
     let slider = if in_column(BRIGHTNESS_X) {
@@ -1082,6 +1270,71 @@ pub fn control_at(canvas_width: u32, scale: f32, (x, y): (f32, f32)) -> Option<C
         return None;
     };
     Some(ControlHit::Slider(slider, slider_value(scale, y * scale)))
+}
+
+/// The Displays sheet's parts, for `count` screens in a Control Center at
+/// `left`, `width` wide.
+struct DisplaysGeometry {
+    x0: f32,
+    x1: f32,
+    y0: f32,
+    y1: f32,
+    row_h: f32,
+}
+
+/// One screen's row: where its name sits and where its slider's track
+/// starts.
+struct DisplayRow {
+    name_baseline: f32,
+    track_y: f32,
+}
+
+impl DisplaysGeometry {
+    fn new(left: f32, width: f32, count: usize) -> Self {
+        let (y0, y1) = (CC_TOP, CC_TOP + CC_HEIGHT);
+        let rows = (y1 - y0 - DISPLAYS_HEADER - 4.0) / count.max(1) as f32;
+        Self { x0: left + DISPLAYS_INSET, x1: left + width - DISPLAYS_INSET, y0, y1, row_h: rows.min(DISPLAY_ROW_MAX) }
+    }
+
+    fn row(&self, i: usize) -> DisplayRow {
+        let top = self.y0 + DISPLAYS_HEADER + i as f32 * self.row_h;
+        // With little room the name and slider move closer.
+        let gap = (self.row_h - DISPLAY_SLIDER_H - 14.0).clamp(2.0, 8.0);
+        DisplayRow { name_baseline: top + 11.0, track_y: top + 11.0 + gap }
+    }
+
+    /// Left and right ends of the sliders' tracks.
+    fn track(&self) -> (f32, f32) {
+        (self.x0 + 16.0, self.x1 - 16.0)
+    }
+}
+
+/// What on the open Displays sheet is under a point in physical canvas
+/// pixels, for `count` screens; `None` off the sheet.
+pub fn display_at(canvas_width: u32, scale: f32, count: usize, (x, y): (f32, f32)) -> Option<DisplayHit> {
+    let left = (canvas_width as f32 / scale - CONTROLS_WIDTH) / 2.0;
+    let (x, y) = (x / scale, y / scale);
+    let g = DisplaysGeometry::new(left, CONTROLS_WIDTH, count);
+    if x < g.x0 || x > g.x1 || y < g.y0 || y > g.y1 {
+        return None;
+    }
+    let (tx0, tx1) = g.track();
+    for i in 0..count {
+        let row = g.row(i);
+        // A little taller than the track, for an easier grab.
+        if (row.track_y - 6.0..=row.track_y + DISPLAY_SLIDER_H + 6.0).contains(&y) && (tx0 - 8.0..=tx1 + 8.0).contains(&x) {
+            return Some(DisplayHit::Slider(i, display_value(canvas_width, scale, count, x * scale)));
+        }
+    }
+    Some(DisplayHit::Sheet)
+}
+
+/// A screen slider's value (0..1) at a physical x, clamped; for dragging
+/// past either end.
+pub fn display_value(canvas_width: u32, scale: f32, count: usize, x: f32) -> f32 {
+    let left = (canvas_width as f32 / scale - CONTROLS_WIDTH) / 2.0;
+    let (tx0, tx1) = DisplaysGeometry::new(left, CONTROLS_WIDTH, count).track();
+    ((x / scale - tx0) / (tx1 - tx0)).clamp(0.0, 1.0)
 }
 
 /// A slider's value (0..1) at a physical y, clamped; for dragging past
@@ -1259,7 +1512,8 @@ impl Canvas<'_> {
         }
 
         let brightness = view.brightness.or(s.brightness.map(|b| b as f32 / 100.0));
-        self.slider(left + BRIGHTNESS_X, brightness, Slider::Brightness, false, alpha);
+        let multi = view.displays.len() > 1;
+        self.slider(left + BRIGHTNESS_X, brightness, Slider::Brightness, multi, alpha);
         self.slider(left + VOLUME_X, Some(view.volume), Slider::Volume, view.muted, alpha);
 
         let modules_w = modules_width(width);
@@ -1270,6 +1524,120 @@ impl Canvas<'_> {
             self.battery_module(view.battery, x, lower, alpha);
             let bt_x = x + MODULE_H + MODULE_GAP;
             self.bluetooth_module(view, bt_x, lower, modules_w - MODULE_H - MODULE_GAP, alpha);
+        }
+        if view.displays_reveal > 0.001 {
+            self.displays_sheet(view, left, width, alpha);
+        }
+    }
+
+    /// Each screen's brightness on its own slider, like the Display module
+    /// of Control Center on a Mac: a sheet that grows out of the brightness
+    /// slider over the Control Center, a row per screen with its symbol
+    /// (laptop or monitor), name and level. Rows fade in once it is nearly
+    /// full size, so none shows cut off by its growing edge.
+    fn displays_sheet(&mut self, view: &ControlsView, left: f32, width: f32, alpha: f32) {
+        let Some(fonts) = self.fonts else { return };
+        let r = view.displays_reveal.max(0.0);
+        let g = DisplaysGeometry::new(left, width, view.displays.len());
+        let from = (left + BRIGHTNESS_X, CC_TOP, left + BRIGHTNESS_X + SLIDER_W, CC_TOP + CC_HEIGHT);
+        let lerp = |a: f32, b: f32| a + (b - a) * r;
+        let (l, t) = (lerp(from.0, g.x0), lerp(from.1, g.y0));
+        let (rt, b) = (lerp(from.2, g.x1), lerp(from.3, g.y1));
+        let radius = lerp(24.0, 22.0);
+        let Some(sheet) = rounded_rect(l, t, rt - l, b - t, radius) else { return };
+        self.fill(&sheet, SHEET_RGB, alpha * (r * 4.0).min(1.0));
+        self.stroke(&sheet, 1.0, WHITE, alpha * 0.08 * r.min(1.0));
+        let rows = ((r - 0.85) / 0.15).clamp(0.0, 1.0);
+        if rows <= 0.0 {
+            return;
+        }
+        let a = alpha * rows;
+        // Rows settle a few px up into place as they appear.
+        let rise = (1.0 - ease_out_cubic(rows)) * 6.0;
+        self.dy += rise;
+        self.text(&fonts.semibold, "Displays", 13.0, g.x0 + 16.0, g.y0 + 21.0, f32::MAX, WHITE, a);
+        for (i, display) in view.displays.iter().enumerate() {
+            let row = g.row(i);
+            let level = match view.display_drag {
+                Some((d, v)) if d == i => Some(v),
+                _ => display.percent.map(|p| p as f32 / 100.0),
+            };
+            // Symbol and name, the level on the right.
+            let (sx, name_y) = (g.x0 + 24.0, row.name_baseline);
+            if display.internal {
+                self.laptop_icon(sx, name_y - 4.0, a);
+            } else {
+                self.output_icon(OutputKind::Display, sx, name_y - 4.0, a);
+            }
+            let percent = level.map_or("–".to_string(), |v| format!("{}%", (v * 100.0).round() as u32));
+            self.text_right(&fonts.semibold, &percent, 11.5, g.x1 - 16.0, name_y, GRAY, a);
+            let name_max = g.x1 - 16.0 - 40.0 - (g.x0 + 40.0);
+            self.text(&fonts.semibold, &display.name, 12.5, g.x0 + 40.0, name_y, name_max, WHITE, a);
+            // The slider: a track, the level up to the pointer, and a small
+            // sun that darkens once the white covers it.
+            let (tx0, tx1) = g.track();
+            let Some(track) = rounded_rect(tx0, row.track_y, tx1 - tx0, DISPLAY_SLIDER_H, DISPLAY_SLIDER_H / 2.0) else {
+                continue;
+            };
+            let available = a * if level.is_some() { 1.0 } else { 0.4 };
+            self.fill(&track, WHITE, available * 0.16);
+            let v = level.unwrap_or(0.0).clamp(0.0, 1.0);
+            let x = tx0 + (tx1 - tx0) * v;
+            if let Some(fill) = Rect::from_ltrb(tx0, row.track_y, x.max(tx0 + 0.5), row.track_y + DISPLAY_SLIDER_H) {
+                self.fill_within(&PathBuilder::from_rect(fill), &track, WHITE, available * 0.95);
+            }
+            let sun = (tx0 + 12.0, row.track_y + DISPLAY_SLIDER_H / 2.0);
+            self.small_sun(sun.0, sun.1, x > sun.0 + 6.0, available);
+        }
+        self.dy -= rise;
+    }
+
+    /// A laptop: a screen over a wider base, centered on (cx, cy).
+    fn laptop_icon(&mut self, cx: f32, cy: f32, alpha: f32) {
+        if let Some(screen) = rounded_rect(cx - 7.0, cy - 6.0, 14.0, 9.5, 1.8) {
+            self.stroke(&screen, 1.6, WHITE, alpha);
+        }
+        let mut pb = PathBuilder::new();
+        pb.move_to(cx - 9.5, cy + 6.0);
+        pb.line_to(cx + 9.5, cy + 6.0);
+        if let Some(base) = pb.finish() {
+            self.stroke(&base, 1.6, WHITE, alpha);
+        }
+    }
+
+    /// Two screens, one behind the other: the brightness slider's symbol
+    /// when there are several (it opens the Displays sheet).
+    fn screens_icon(&mut self, cx: f32, cy: f32, dark: bool, alpha: f32) {
+        let rgb = if dark { [40, 40, 40] } else { WHITE };
+        if let Some(back) = rounded_rect(cx - 4.0, cy - 7.5, 12.0, 8.5, 1.6) {
+            self.stroke(&back, 1.4, rgb, alpha * 0.7);
+        }
+        if let Some(front) = rounded_rect(cx - 8.0, cy - 3.5, 12.0, 8.5, 1.6) {
+            self.fill(&front, if dark { [235, 235, 235] } else { [44, 44, 46] }, alpha);
+            self.stroke(&front, 1.4, rgb, alpha);
+        }
+        let mut pb = PathBuilder::new();
+        pb.move_to(cx - 5.0, cy + 7.5);
+        pb.line_to(cx + 1.0, cy + 7.5);
+        if let Some(stand) = pb.finish() {
+            self.stroke(&stand, 1.4, rgb, alpha);
+        }
+    }
+
+    /// `sun_icon`, smaller, for a screen's slider in the Displays sheet.
+    fn small_sun(&mut self, cx: f32, cy: f32, dark: bool, alpha: f32) {
+        let rgb = if dark { [40, 40, 40] } else { WHITE };
+        if let Some(disc) = PathBuilder::from_circle(cx, cy, 2.4) {
+            self.fill(&disc, rgb, alpha);
+        }
+        let mut pb = PathBuilder::new();
+        for i in 0..8 {
+            let (sin, cos) = (i as f32 * std::f32::consts::FRAC_PI_4).sin_cos();
+            pb.move_to(cx + cos * 4.0, cy + sin * 4.0);
+            pb.line_to(cx + cos * 5.4, cy + sin * 5.4);
+        }
+        if let Some(rays) = pb.finish() {
+            self.stroke(&rays, 1.2, rgb, alpha);
         }
     }
 
@@ -1388,8 +1756,10 @@ impl Canvas<'_> {
     }
 
     /// A tall capsule that fills from the bottom, its symbol at the foot.
-    /// `None` (no software brightness) draws it empty and dimmed.
-    fn slider(&mut self, x: f32, value: Option<f32>, kind: Slider, muted: bool, alpha: f32) {
+    /// `None` (no software brightness) draws it empty and dimmed. `alt`
+    /// picks the symbol's other form: volume muted, or brightness for
+    /// several screens (a pair of screens, a button for the Displays sheet).
+    fn slider(&mut self, x: f32, value: Option<f32>, kind: Slider, alt: bool, alpha: f32) {
         let Some(capsule) = rounded_rect(x, CC_TOP, SLIDER_W, CC_HEIGHT, 24.0) else { return };
         let alpha = alpha * if value.is_some() { 1.0 } else { 0.4 };
         self.fill(&capsule, WHITE, alpha * 0.16);
@@ -1409,29 +1779,20 @@ impl Canvas<'_> {
         let covered = level_h > 30.0;
         let a = alpha * if covered { 0.75 } else { 1.0 };
         match kind {
+            // Several screens: a pair of screens, which opens the sheet.
+            Slider::Brightness if alt => self.screens_icon(cx, cy, covered, a),
             Slider::Brightness => self.sun_icon(cx, cy, covered, a),
-            Slider::Volume if covered => self.dark_speaker(cx - 6.0, cy, v, muted, a),
-            Slider::Volume => self.speaker_icon(cx - 6.0, cy, v, muted, a),
+            Slider::Volume if covered => self.dark_speaker(cx - 6.0, cy, v, alt, a),
+            Slider::Volume => self.speaker_icon(cx - 6.0, cy, v, alt, a),
         }
     }
 
     /// `speaker_icon` in near-black, for on top of a white slider level.
     fn dark_speaker(&mut self, x: f32, cy: f32, level: f32, muted: bool, alpha: f32) {
-        // Drawn into a scratch layer, then tinted: the speaker paths are
-        // white-only, and this keeps them in one place.
-        let Some(mut layer) = Pixmap::new(self.pixmap.width(), self.pixmap.height()) else { return };
-        let mut scratch = Canvas { pixmap: &mut layer, clip: self.clip, scale: self.scale, fonts: self.fonts, dx: self.dx, dy: self.dy };
-        scratch.speaker_icon(x, cy, level, muted, 1.0);
-        for px in layer.data_mut().chunks_exact_mut(4) {
-            // Premultiplied white becomes premultiplied near-black.
-            let a = px[3] as f32 / 255.0;
-            let dark = (40.0 * a) as u8;
-            px[0] = dark;
-            px[1] = dark;
-            px[2] = dark;
-        }
-        let paint = tiny_skia::PixmapPaint { opacity: alpha, ..Default::default() };
-        self.pixmap.draw_pixmap(0, 0, layer.as_ref(), &paint, Transform::identity(), None);
+        // Drawn straight in near-black. (It used to be drawn white into a
+        // canvas-sized layer and tinted: a full-canvas allocation, pass and
+        // composite every frame for a 16 px icon.)
+        self.speaker_icon_in(x, cy, level, muted, [40, 40, 40], alpha);
     }
 
     /// The shelf page: a header with Share and Clear, then the files as
@@ -1447,17 +1808,28 @@ impl Canvas<'_> {
             n => format!("Shelf \u{b7} {n} files"),
         };
         self.text(&fonts.semibold, &title, 13.0, g.left + 22.0, SHELF_BUTTON_Y + 4.5, 200.0, WHITE, alpha);
-        if count > 0 {
-            for (hit, (cx, cy)) in [(ShelfHit::Share, g.share_center()), (ShelfHit::Clear, g.clear_center())] {
-                let lit = view.hover == Some(hit) || view.pressed == Some(hit);
-                if let Some(disc) = PathBuilder::from_circle(cx, cy, SHELF_BUTTON_R) {
-                    self.fill(&disc, WHITE, alpha * if lit { 0.22 } else { 0.12 });
-                }
-                match hit {
-                    ShelfHit::Share => self.share_icon(cx, cy, alpha),
-                    _ => self.trash_icon(cx, cy, alpha),
-                }
+        // The last file thrown out, if any: the buttons stay until it is in
+        // the bin, and an emptied shelf's drop zone comes in after.
+        let last_throw = view.departures.iter().map(|d| d.t).reduce(f32::min);
+        let settled = last_throw.map_or(1.0, |t| ((t - THROW * 0.8) / GULP).clamp(0.0, 1.0));
+        let buttons = if count > 0 { 1.0 } else if last_throw.is_some() { 1.0 - settled } else { 0.0 };
+        if buttons > 0.0 {
+            let a = alpha * buttons;
+            let lit = |hit| view.hover == Some(hit) || view.pressed == Some(hit);
+            let (cx, cy) = g.share_center();
+            if let Some(disc) = PathBuilder::from_circle(cx, cy, SHELF_BUTTON_R) {
+                self.fill(&disc, WHITE, a * if lit(ShelfHit::Share) { 0.22 } else { 0.12 });
             }
+            self.share_icon(cx, cy, a);
+            let clear = g.clear_rect();
+            if let Some(pill) = rounded_rect(clear.left(), clear.top(), clear.width(), clear.height(), SHELF_BUTTON_R) {
+                self.fill(&pill, WHITE, a * if lit(ShelfHit::Clear) { 0.22 } else { 0.12 });
+            }
+            // The bin opens its lid as a file comes at it and gulps it down.
+            let (lid, gulp) = bin_motion(view.departures);
+            let (bx, by) = g.bin_center();
+            self.trash_icon(bx, by, lid, 1.0 + 0.18 * gulp, a);
+            self.text(&fonts.semibold, "Clear All", 11.5, bx + 11.0, SHELF_BUTTON_Y + 4.0, f32::MAX, WHITE, a);
         }
 
         // The drop zone: always there while the shelf is empty; over the
@@ -1471,7 +1843,7 @@ impl Canvas<'_> {
         // rest.
         let (before, after) = ((1.0 - glow / 0.45).clamp(0.0, 1.0), ((glow - 0.45) / 0.55).clamp(0.0, 1.0));
         let (x0, x1) = g.strip();
-        let zone_alpha = alpha * if count == 0 { 1.0 } else { glow };
+        let zone_alpha = alpha * if count == 0 { settled.max(glow) } else { glow };
         if zone_alpha > 0.01 {
             let grow = 3.0 * pop;
             let (w, h) = (x1 - x0 + 2.0 * grow, SHELF_TILE_H - 4.0 + 2.0 * grow);
@@ -1499,12 +1871,21 @@ impl Canvas<'_> {
             }
         }
         if count == 0 {
+            self.thrown(view, &g, alpha);
             return;
         }
         let tiles_alpha = alpha * before;
 
         for (i, item) in view.items.iter().enumerate() {
             let mut x = g.tile_x(i, view.scroll);
+            // A file was just taken off: every tile glides from where it
+            // was (with one more file, the row was laid out differently)
+            // to its place, closing the gap.
+            if let Some((gap, t)) = view.closing {
+                let before = ShelfGeometry::new(canvas_w, count + 1);
+                let was = before.tile_x(if i >= gap { i + 1 } else { i }, view.scroll);
+                x += (was - x) * (1.0 - ease_out_cubic((t / CLOSE_GAP).clamp(0.0, 1.0)));
+            }
             // Just dropped: the new files fly in, one after another, while
             // the ones already there slide over to make room. In flight they
             // are not held back by the drop zone fading out.
@@ -1525,6 +1906,56 @@ impl Canvas<'_> {
             }
             self.shelf_tile(view, i, item, x, motion, a);
         }
+        self.thrown(view, &g, alpha);
+    }
+
+    /// The files on their way into the bin, over everything else on the
+    /// shelf. Each is picked up (a small lift), then thrown in an arc
+    /// toward the Clear All button's bin, shrinking and tipping over as it
+    /// goes, and vanishes into it.
+    fn thrown(&mut self, view: &ShelfView, g: &ShelfGeometry, alpha: f32) {
+        let bin = g.bin_center();
+        for d in view.departures {
+            let p = (d.t / THROW).clamp(0.0, 1.0);
+            if d.t >= THROW {
+                continue;
+            }
+            // Smooth start and end; the path bends up over the shelf and
+            // drops into the bin.
+            let e = p * p * (3.0 - 2.0 * p);
+            let control = ((d.from.0 + bin.0) / 2.0, d.from.1.min(bin.1) - 34.0);
+            let bezier = |a: f32, c: f32, b: f32| (1.0 - e) * (1.0 - e) * a + 2.0 * (1.0 - e) * e * c + e * e * b;
+            let (cx, cy) = (bezier(d.from.0, control.0, bin.0), bezier(d.from.1, control.1, bin.1));
+            let lift = (std::f32::consts::PI * (p / 0.22).min(1.0)).sin() * 0.12;
+            let zoom = (1.0 - 0.85 * p.powf(1.4)) * (1.0 + lift);
+            let a = alpha * (1.0 - (p - 0.8) / 0.2).clamp(0.0, 1.0);
+            let angle = -28.0 * e;
+            match &d.icon {
+                Some(icon) => self.icon_rotated(icon, cx, cy, zoom, angle, a),
+                None => self.document_glyph(cx, cy, zoom, a),
+            }
+        }
+    }
+
+    /// `icon_image`, turned `angle` degrees about its center.
+    fn icon_rotated(&mut self, img: &Pixmap, cx: f32, cy: f32, zoom: f32, angle: f32, alpha: f32) {
+        let k = zoom / self.scale;
+        let (w, h) = (img.width() as f32 * k, img.height() as f32 * k);
+        let (x, y) = (cx - w / 2.0, cy - h / 2.0);
+        let Some(rect) = Rect::from_xywh(x, y, w, h) else { return };
+        let paint = Paint {
+            shader: Pattern::new(
+                img.as_ref(),
+                SpreadMode::Pad,
+                FilterQuality::Bilinear,
+                alpha,
+                Transform::from_row(k, 0.0, 0.0, k, x, y),
+            ),
+            anti_alias: true,
+            ..Default::default()
+        };
+        let ts = self.transform().pre_concat(Transform::from_rotate_at(angle, cx, cy));
+        self.pixmap.fill_path(&PathBuilder::from_rect(rect), &paint, FillRule::Winding, ts, Some(self.clip));
     }
 
     /// One file's tile at `x`: highlight, icon (where `motion` puts it),
@@ -1657,22 +2088,30 @@ impl Canvas<'_> {
     }
 
     /// A bin: lid with a handle, and a tapered body with two ribs.
-    fn trash_icon(&mut self, cx: f32, cy: f32, alpha: f32) {
+    /// `lid` (0..1) tips the lid open about its right end; `scale` swells
+    /// the whole bin about its center.
+    fn trash_icon(&mut self, cx: f32, cy: f32, lid: f32, scale: f32, alpha: f32) {
+        let at = |dx: f32, dy: f32| (cx + dx * scale, cy + dy * scale);
+        let hinge = at(6.0, -4.0);
+        // Positive turns the free (left) end up, y growing downward.
+        let (sin, cos) = (lid * 40f32).to_radians().sin_cos();
+        let turn = |(x, y): (f32, f32)| {
+            let (dx, dy) = (x - hinge.0, y - hinge.1);
+            (hinge.0 + dx * cos - dy * sin, hinge.1 + dx * sin + dy * cos)
+        };
+        // Strokes: the lid's bar and handle (turned), the body, two ribs.
+        let lid_bar = [at(-6.0, -4.0), at(6.0, -4.0)].map(turn);
+        let handle = [at(-2.0, -4.0), at(-2.0, -6.0), at(2.0, -6.0), at(2.0, -4.0)].map(turn);
+        let body = [at(-4.5, -4.0), at(-3.8, 6.0), at(3.8, 6.0), at(4.5, -4.0)];
+        let ribs = [[at(-1.4, -1.0), at(-1.2, 3.5)], [at(1.4, -1.0), at(1.2, 3.5)]];
         let mut pb = PathBuilder::new();
-        pb.move_to(cx - 6.0, cy - 4.0);
-        pb.line_to(cx + 6.0, cy - 4.0);
-        pb.move_to(cx - 2.0, cy - 4.0);
-        pb.line_to(cx - 2.0, cy - 6.0);
-        pb.line_to(cx + 2.0, cy - 6.0);
-        pb.line_to(cx + 2.0, cy - 4.0);
-        pb.move_to(cx - 4.5, cy - 4.0);
-        pb.line_to(cx - 3.8, cy + 6.0);
-        pb.line_to(cx + 3.8, cy + 6.0);
-        pb.line_to(cx + 4.5, cy - 4.0);
-        pb.move_to(cx - 1.4, cy - 1.0);
-        pb.line_to(cx - 1.2, cy + 3.5);
-        pb.move_to(cx + 1.4, cy - 1.0);
-        pb.line_to(cx + 1.2, cy + 3.5);
+        let polyline: [&[(f32, f32)]; 5] = [&lid_bar, &handle, &body, &ribs[0], &ribs[1]];
+        for points in polyline {
+            pb.move_to(points[0].0, points[0].1);
+            for &(x, y) in &points[1..] {
+                pb.line_to(x, y);
+            }
+        }
         if let Some(path) = pb.finish() {
             self.stroke(&path, 1.5, WHITE, alpha);
         }
@@ -1725,15 +2164,44 @@ impl Canvas<'_> {
 
     /// Fills `path` clipped to `within` as well as to the notch.
     fn fill_within(&mut self, path: &Path, within: &Path, rgb: Rgb, alpha: f32) {
-        let Some(mut mask) = Mask::new(self.pixmap.width(), self.pixmap.height()) else { return };
-        mask.fill_path(within, FillRule::Winding, true, self.transform());
-        for (m, c) in mask.data_mut().iter_mut().zip(self.clip.data()) {
-            *m = ((*m as u16 * *c as u16) / 255) as u8;
+        let (w, h) = (self.pixmap.width(), self.pixmap.height());
+        let ts = self.transform();
+        // Only `within`'s bounds can be non-zero: the clip is merged there,
+        // not over the whole canvas (sliders and the progress bar are a few
+        // hundred pixels of it). The mask is kept between calls.
+        let Some(bounds) = within.bounds().transform(ts) else { return };
+        let (x0, y0) = ((bounds.left().floor().max(0.0)) as usize, (bounds.top().floor().max(0.0)) as usize);
+        let (x1, y1) = ((bounds.right().ceil() as usize + 1).min(w as usize), (bounds.bottom().ceil() as usize + 1).min(h as usize));
+        if x0 >= x1 || y0 >= y1 {
+            return;
         }
-        let mut paint = Paint::default();
-        paint.set_color(Color::from_rgba8(rgb[0], rgb[1], rgb[2], (alpha * 255.0) as u8));
-        paint.anti_alias = true;
-        self.pixmap.fill_path(path, &paint, FillRule::Winding, self.transform(), Some(&mask));
+        SCRATCH_MASK.with_borrow_mut(|slot| {
+            let mask = match slot.take() {
+                Some(mut mask) if mask.width() == w && mask.height() == h => {
+                    mask.data_mut().fill(0);
+                    mask
+                }
+                _ => match Mask::new(w, h) {
+                    Some(mask) => mask,
+                    None => return,
+                },
+            };
+            let mut mask = mask;
+            mask.fill_path(within, FillRule::Winding, true, ts);
+            let clip = self.clip.data();
+            let data = mask.data_mut();
+            for y in y0..y1 {
+                let row = y * w as usize;
+                for (m, c) in data[row + x0..row + x1].iter_mut().zip(&clip[row + x0..row + x1]) {
+                    *m = ((*m as u16 * *c as u16) / 255) as u8;
+                }
+            }
+            let mut paint = Paint::default();
+            paint.set_color(Color::from_rgba8(rgb[0], rgb[1], rgb[2], (alpha * 255.0) as u8));
+            paint.anti_alias = true;
+            self.pixmap.fill_path(path, &paint, FillRule::Winding, ts, Some(&mask));
+            *slot = Some(mask);
+        });
     }
 
     /// SF-style airplane, nose up, about 15 px tall.
@@ -2117,6 +2585,12 @@ impl Canvas<'_> {
     /// waves for the level, or a slash when muted. (x, mid) is the left
     /// edge of its body.
     fn speaker_icon(&mut self, x: f32, mid: f32, level: f32, muted: bool, alpha: f32) {
+        self.speaker_icon_in(x, mid, level, muted, WHITE, alpha);
+    }
+
+    /// `speaker_icon` in `rgb`.
+    #[allow(clippy::too_many_arguments)]
+    fn speaker_icon_in(&mut self, x: f32, mid: f32, level: f32, muted: bool, rgb: Rgb, alpha: f32) {
         let mut pb = PathBuilder::new();
         if let Some(body) = rounded_rect(x, mid - 3.0, 4.0, 6.0, 1.3) {
             pb.push_path(&body);
@@ -2131,7 +2605,7 @@ impl Canvas<'_> {
         if let Some(speaker) = pb.finish() {
             // Body and cone overlap; non-zero winding keeps the overlap solid.
             let mut paint = Paint::default();
-            paint.set_color(Color::from_rgba8(255, 255, 255, (alpha * 255.0) as u8));
+            paint.set_color(Color::from_rgba8(rgb[0], rgb[1], rgb[2], (alpha * 255.0) as u8));
             paint.anti_alias = true;
             let ts = self.transform();
             self.pixmap.fill_path(&speaker, &paint, FillRule::Winding, ts, Some(self.clip));
@@ -2144,8 +2618,9 @@ impl Canvas<'_> {
             pb.move_to(x - 1.0, mid - 7.5);
             pb.line_to(x + 12.0, mid + 7.5);
             if let Some(slash) = pb.finish() {
-                self.stroke(&slash, 4.0, [0, 0, 0], alpha);
-                self.stroke(&slash, 1.6, WHITE, alpha);
+                // A dark edge cut around the slash; on a dark icon, the icon's own color.
+                self.stroke(&slash, 4.0, if rgb == WHITE { [0, 0, 0] } else { rgb }, alpha);
+                self.stroke(&slash, 1.6, rgb, alpha);
             }
             return;
         }
@@ -2167,7 +2642,7 @@ impl Canvas<'_> {
                 // Waves above the level stay faintly visible, like the
                 // variable-color speaker symbol.
                 let on = i < waves;
-                self.stroke(&arc, 1.6, WHITE, alpha * if on { 1.0 } else { 0.25 });
+                self.stroke(&arc, 1.6, rgb, alpha * if on { 1.0 } else { 0.25 });
             }
         }
     }
@@ -2827,7 +3302,7 @@ mod tests {
         out.fill(Color::from_rgba8(225, 228, 235, 255));
         let pad = (SHADOW_PAD * scale) as u32;
         let mut shadow = Pixmap::new(notch.width() + 2 * pad, notch.height() + pad).unwrap();
-        draw_shadow(&mut shadow, scale, scene.shape);
+        draw_shadow(&mut shadow, scale, scene.shape, scene.open_zoom);
         out.draw_pixmap(-(pad as i32), 0, shadow.as_ref(), &Default::default(), Transform::identity(), None);
         out.draw_pixmap(0, 0, notch.as_ref(), &Default::default(), Transform::identity(), None);
         out.save_png(format!("{}/target/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap();
@@ -2835,6 +3310,45 @@ mod tests {
 
     /// Renders the open notch to `target/preview*.png` to check the layout
     /// without hovering: `cargo test preview -- --ignored`.
+    #[test]
+    fn now_playing_module_opens_the_player() {
+        // 660 px canvas at 1x: Control Center from x 50.
+        let left = (660.0 - CONTROLS_WIDTH) / 2.0;
+        let y = CC_TOP + MODULE_H / 2.0;
+        let right = left + MODULES_X + modules_width(CONTROLS_WIDTH);
+        assert_eq!(control_at(660, 1.0, false, (left + MODULES_X + 30.0, y)), Some(ControlHit::NowPlaying));
+        assert_eq!(control_at(660, 1.0, false, (right - 10.0, y)), Some(ControlHit::PlayPause));
+        // Below it, the battery and Bluetooth modules are not buttons.
+        assert_eq!(control_at(660, 1.0, false, (left + MODULES_X + 30.0, CC_TOP + MODULE_H + 20.0)), None);
+    }
+
+    #[test]
+    fn displays_hit_testing() {
+        // 660 px canvas at 1x: Control Center from x 50 (560 wide).
+        let left = (660.0 - CONTROLS_WIDTH) / 2.0;
+        let foot = (left + BRIGHTNESS_X + SLIDER_W / 2.0, CC_TOP + CC_HEIGHT - 12.0);
+        // One screen: the foot is just the slider; several: the button.
+        assert!(matches!(control_at(660, 1.0, false, foot), Some(ControlHit::Slider(Slider::Brightness, _))));
+        assert_eq!(control_at(660, 1.0, true, foot), Some(ControlHit::Displays));
+        // Higher up it is still the slider.
+        let mid = (foot.0, CC_TOP + 40.0);
+        assert!(matches!(control_at(660, 1.0, true, mid), Some(ControlHit::Slider(Slider::Brightness, _))));
+        // On the open sheet: each row's slider, by where along it.
+        let g = DisplaysGeometry::new(left, CONTROLS_WIDTH, 2);
+        let (x0, x1) = g.track();
+        for i in 0..2 {
+            let y = g.row(i).track_y + DISPLAY_SLIDER_H / 2.0;
+            assert_eq!(display_at(660, 1.0, 2, (x0, y)), Some(DisplayHit::Slider(i, 0.0)));
+            assert_eq!(display_at(660, 1.0, 2, ((x0 + x1) / 2.0, y)), Some(DisplayHit::Slider(i, 0.5)));
+        }
+        assert_eq!(display_at(660, 1.0, 2, (left + 40.0, CC_TOP + 14.0)), Some(DisplayHit::Sheet), "the title");
+        assert_eq!(display_at(660, 1.0, 2, (5.0, 70.0)), None, "off the sheet");
+        assert_eq!(display_at(660, 1.0, 2, (330.0, 145.0)), None, "below the sheet");
+        // Dragging keeps tracking past either end.
+        assert_eq!(display_value(660, 1.0, 2, 0.0), 0.0);
+        assert_eq!(display_value(660, 1.0, 2, 659.0), 1.0);
+    }
+
     #[test]
     fn progress_hit_testing() {
         // Lyrics shown, 1x scale, 600 px canvas: the bar spans x 116..224
@@ -2890,6 +3404,8 @@ mod tests {
                 alert_from: None,
                 clock: 0.0,
                 levels: None,
+                open_zoom: 1.0,
+                page_order: Page::ALL,
                 time: "9:41",
                 outputs: OutputsView::default(),
                 shelf: ShelfView::default(),
@@ -2921,6 +3437,8 @@ mod tests {
                 alert_from: None,
                 clock: 0.0,
                 levels: None,
+                open_zoom: 1.0,
+                page_order: Page::ALL,
                 time: "9:41",
                 outputs: OutputsView::default(),
                 shelf: ShelfView::default(),
@@ -2944,6 +3462,7 @@ mod tests {
             toggle_on: Toggle::ALL.map(|t| if t.is_on(&state, false) { 1.0 } else { 0.0 }),
             // Mute pressed in, to show the press.
             toggle_scale: Toggle::ALL.map(|t| if t == Toggle::Mute { 0.88 } else { 1.0 }),
+            ..Default::default()
         };
         let page = |width: f32, page: f32| Scene {
             shape: Shape { width, ..EXPANDED },
@@ -2961,6 +3480,8 @@ mod tests {
             alert_from: None,
             clock: 0.0,
             levels: None,
+            open_zoom: 1.0,
+            page_order: Page::ALL,
             time: "9:41",
             outputs: OutputsView::default(),
             shelf: ShelfView::default(),
@@ -2984,11 +3505,19 @@ mod tests {
         // The notch as wide as the page it is on.
         fn opened(scene: Scene<'_>) -> Scene<'_> {
             Scene {
-                shape: Shape { width: open_width(scene.panel_width, scene.page, scene.shelf.items.len()), ..EXPANDED },
+                shape: Shape {
+                    width: open_width(scene.page_order, scene.panel_width, scene.page, scene.shelf.items.len()),
+                    ..EXPANDED
+                },
                 ..scene
             }
         }
         save_preview(&picker(1.0), "preview_outputs.png");
+        // The Open size setting: the whole open notch scaled.
+        for (zoom, name) in [(0.9, "preview_open_compact.png"), (1.1, "preview_open_large.png")] {
+            let shape = Shape { width: EXPANDED.width * zoom, height: EXPANDED.height * zoom, radius: EXPANDED.radius * zoom };
+            save_preview(&Scene { shape, open_zoom: zoom, ..page(EXPANDED.width, 0.0) }, name);
+        }
         save_preview(&picker(0.15), "preview_outputs_opening_a.png");
         save_preview(&picker(0.45), "preview_outputs_opening_b.png");
         save_preview(&picker(0.75), "preview_outputs_opening_c.png");
@@ -2999,6 +3528,24 @@ mod tests {
         };
         save_preview(&sliding, "preview_outputs_picking.png");
         save_preview(&opened(page(EXPANDED.width, 1.0)), "preview_controls.png");
+        // A custom order (Layout setting): Control Center left, shelf right;
+        // halfway from the player to Control Center.
+        let order = [Page::Controls, Page::Player, Page::Shelf];
+        for (name, at) in [("left", -1.0), ("between", -0.5), ("right", 1.0)] {
+            let scene = Scene { page_order: order, ..page(EXPANDED.width, at) };
+            save_preview(&opened(scene), &format!("preview_order_{name}.png"));
+        }
+        // A laptop with an external monitor: the brightness slider's symbol
+        // becomes a pair of screens, which opens each screen's slider.
+        let screens = [
+            DisplayLevel { name: "Built-in Display".into(), internal: true, percent: Some(81) },
+            DisplayLevel { name: "Mi Monitor".into(), internal: false, percent: Some(100) },
+        ];
+        for (name, reveal) in [("closed", 0.0), ("opening", 0.55), ("open", 1.0)] {
+            let view = ControlsView { displays: &screens, displays_reveal: reveal, ..controls };
+            let scene = Scene { controls: view, ..page(EXPANDED.width, 1.0) };
+            save_preview(&opened(scene), &format!("preview_displays_{name}.png"));
+        }
         save_preview(&opened(page(PLAYER_ONLY_WIDTH, 0.5)), "preview_controls_narrow_sliding.png");
         save_preview(&opened(page(EXPANDED.width, 0.5)), "preview_controls_sliding.png");
 
@@ -3035,6 +3582,26 @@ mod tests {
         }
         let sliding = Scene { shelf: ShelfView { items: &items, ..Default::default() }, ..page(EXPANDED.width, -0.5) };
         save_preview(&opened(sliding), "preview_shelf_sliding.png");
+        // Taking the middle file off: it is thrown into the bin while the
+        // last slides over; then Clear All throwing the rest.
+        let middle = shelf_icon_center(1200, 2.0, items.len(), 0.0, 1).unwrap();
+        let kept = [file("Holiday photo.jpg", items[0].icon.clone()), file("notes.txt", None)];
+        for (name, t) in [("a", 0.08), ("b", 0.22), ("c", 0.4), ("d", 0.6)] {
+            let departures = [Departure { icon: None, from: middle, t }];
+            let view = ShelfView { items: &kept, departures: &departures, closing: Some((1, t)), ..Default::default() };
+            save_preview(&opened(Scene { shelf: view, ..page(EXPANDED.width, -1.0) }), &format!("preview_shelf_remove_{name}.png"));
+        }
+        let all: Vec<(f32, f32)> = (0..kept.len()).map(|i| shelf_icon_center(1200, 2.0, kept.len(), 0.0, i).unwrap()).collect();
+        for (name, t) in [("a", 0.2), ("b", 0.45), ("c", 0.8)] {
+            let departures: Vec<Departure> = kept
+                .iter()
+                .zip(&all)
+                .enumerate()
+                .map(|(i, (item, &from))| Departure { icon: item.icon.clone(), from, t: t - THROW_STAGGER * i as f32 })
+                .collect();
+            let view = ShelfView { departures: &departures, ..Default::default() };
+            save_preview(&opened(Scene { shelf: view, ..page(EXPANDED.width, -1.0) }), &format!("preview_shelf_clear_{name}.png"));
+        }
 
         // The resting notch with the battery indicator, then the alerts.
         let small = |shape: Shape, battery: Battery, alert: Option<Alert>| Scene {
@@ -3053,6 +3620,8 @@ mod tests {
             alert_from: None,
             clock: 0.0,
             levels: None,
+            open_zoom: 1.0,
+            page_order: Page::ALL,
             time: "9:41",
             outputs: OutputsView::default(),
             shelf: ShelfView::default(),
@@ -3111,6 +3680,7 @@ mod tests {
             icon_is_tile: false,
             app_id: String::new(),
             tint: Some([37, 211, 102]),
+            link: None,
         };
         // As Windows hands over WhatsApp's logo: a small green glyph in a
         // wide transparent margin.
@@ -3130,6 +3700,7 @@ mod tests {
             app: toast.app.clone(),
             app_id: String::new(),
             tint: toast.tint,
+            link: None,
         };
         let toast = Alert::Toast(Arc::new(toast));
         save_preview(&small(TOAST_ALERT, on_battery, Some(toast)), "preview_toast.png");

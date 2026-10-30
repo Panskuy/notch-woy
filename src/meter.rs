@@ -10,43 +10,55 @@
 //! mode, or playing on another device, reads silent; `Bars` then reports
 //! nothing and the equalizers fall back to their own animation.
 
-use std::time::{Duration, Instant};
+use std::sync::atomic::Ordering;
 
 use windows::core::Result;
 use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
 use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
 
-/// How often the default device is looked up again (headphones plugged in,
-/// a new default picked).
-const FOLLOW_EVERY: Duration = Duration::from_secs(1);
+use crate::volume::DEFAULT_DEVICE_GENERATION;
 
 pub struct Meter {
     devices: Option<IMMDeviceEnumerator>,
     meter: Option<IAudioMeterInformation>,
     /// The default device's id, to notice it changing.
     device: Option<String>,
-    checked: Option<Instant>,
+    /// `DEFAULT_DEVICE_GENERATION` when the device was last looked up;
+    /// `None` to look again. Looking up the default device is a call into
+    /// the audio service that can take tens of milliseconds, so it is done
+    /// once at start-up and again only when Windows says the default
+    /// changed, never on a timer in the middle of an animation.
+    followed: Option<u32>,
 }
 
 impl Meter {
-    /// Needs COM on the calling thread.
+    /// Needs COM on the calling thread. Finds the device right away, while
+    /// nothing is animating.
     pub fn new() -> Self {
         let devices = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok() };
-        Self { devices, meter: None, device: None, checked: None }
+        let mut meter = Self { devices, meter: None, device: None, followed: None };
+        meter.follow_if_changed();
+        meter
+    }
+
+    fn follow_if_changed(&mut self) {
+        let generation = DEFAULT_DEVICE_GENERATION.load(Ordering::Relaxed);
+        if self.followed == Some(generation) {
+            return;
+        }
+        self.followed = Some(generation);
+        if let Err(e) = self.follow_default() {
+            eprintln!("audio meter: {e}");
+            self.meter = None;
+            self.device = None;
+        }
     }
 
     /// Peaks (0..1) of the last device period, left and right (both the
     /// mix on a mono device); `None` without an output device.
     pub fn read(&mut self) -> Option<(f32, f32)> {
-        if self.checked.is_none_or(|at| at.elapsed() >= FOLLOW_EVERY) {
-            self.checked = Some(Instant::now());
-            if let Err(e) = self.follow_default() {
-                eprintln!("audio meter: {e}");
-                self.meter = None;
-                self.device = None;
-            }
-        }
+        self.follow_if_changed();
         let meter = self.meter.as_ref()?;
         let peaks = unsafe {
             match meter.GetMeteringChannelCount() {
@@ -64,7 +76,7 @@ impl Meter {
                 // The device went away; look again next time.
                 self.meter = None;
                 self.device = None;
-                self.checked = None;
+                self.followed = None;
                 None
             }
         }
@@ -244,7 +256,7 @@ mod tests {
             let peaks = meter.read();
             let heights = bars.update(peaks, 1.0 / 30.0);
             println!("{peaks:?} {heights:?}");
-            std::thread::sleep(Duration::from_millis(33));
+            std::thread::sleep(std::time::Duration::from_millis(33));
         }
     }
 }

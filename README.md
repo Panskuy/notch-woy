@@ -19,7 +19,9 @@ media player, synced lyrics, and a Control Center when you hover it.
 - **Control Center** (swipe left on the open notch, the page on the right): Wi-Fi, Bluetooth,
   airplane mode and mute toggles, brightness and volume sliders, and Now
   Playing, battery and Bluetooth modules (the connected device's battery
-  too). Brightness also drives external monitors that support DDC/CI.
+  too). Brightness also drives external monitors that support DDC/CI; with
+  more than one screen, its symbol becomes a pair of screens that opens a
+  Displays sheet with each screen's own slider (as on a Mac).
 - **Alerts** that grow out of the notch for:
   - a new track, with an equalizer in the cover's color that moves to the
     music actually playing (the resting notch's equalizer too);
@@ -55,6 +57,12 @@ media player, synced lyrics, and a Control Center when you hover it.
 
 ![Settings window](docs/screenshot-settings.png)
 
+Under **Layout**, the pages are cards, as when arranging Home Screen pages
+on an iPhone: drag one sideways to move it, click one to open the notch on
+it:
+
+![Layout settings](docs/screenshot-layout.png)
+
 The screenshots are rendered from sample data.
 
 ## Install
@@ -76,16 +84,42 @@ Requires Windows 10 or 11, 64-bit.
 | Do this | To |
 |---|---|
 | Hover the notch | Open it |
-| Swipe sideways on the open notch (touchpad, tilt wheel), or turn the mouse wheel | Switch between the shelf (left), the player, and Control Center (right); the wheel turns down to the right. A touchpad drags the pages along |
+| Swipe sideways on the open notch (touchpad, tilt wheel), or turn the mouse wheel | Switch between the pages: the shelf, the player and Control Center, in the order set under Settings → Layout (that order by default); the wheel turns down to the right. A touchpad drags the pages along |
 | Drag files onto the notch | Put them on the shelf (it opens as a drop zone) |
 | On the shelf: drag a file out / click it / its × | Move or copy it there / open it / take it off the shelf (the file stays) |
-| On the shelf: Share / bin | Share every file on it / clear it |
+| On the shelf: Share / Clear All | Share every file on it / take them all off (thrown into the bin; the files stay) |
 | On the shelf: mouse wheel | Scroll through the files, then on to the player |
 | Click or drag the progress bar | Seek |
 | Click 💬 | Show or hide lyrics |
 | Click a notification | Open the app that sent it |
-| Tray icon → Settings… | Turn each kind of alert on or off, show alerts shorter or longer, make the resting notch narrower or wider, set how long a reconnecting Bluetooth device stays quiet. Changes apply at once |
+| Control Center: the Now Playing module (off its play button) | Go to the player |
+| Control Center: the screens symbol under brightness (two or more screens) | Set each screen's brightness on its own; tap off the sheet to close it |
+| Tray icon → Settings… | Turn each kind of alert on or off, show alerts shorter or longer, make the resting notch narrower or wider, make the open notch (on hover) Compact, Normal or Large, set how long a reconnecting Bluetooth device stays quiet. Changes apply at once |
 | Tray icon → Start at login / Exit | Autostart, quit |
+| Run `notch-woy.exe --settings` | Open Settings right away (from a shortcut, say) |
+
+## Plugins
+
+Turn on **Plugins** in Settings → General, then put scripts in the folder
+its **Open Folder** button opens (`%LOCALAPPDATA%\notch-woy\plugins`). The
+format follows [xbar](https://xbarapp.com) and
+[SwiftBar](https://github.com/swiftbar/SwiftBar): a file named
+`{name}.{interval}.{ext}` (`.ps1`, `.cmd`, `.bat`, `.py` or `.exe`; interval
+like `30s`, `10m`, `1h`, at least 5 s) runs on that schedule, and whatever it
+prints becomes an alert when it changes:
+
+```powershell
+# weather.10m.ps1
+$t = (Invoke-RestMethod "https://wttr.in/?format=%t").Trim()
+"Outside: $t | href=https://wttr.in"
+"---"
+"Updated $(Get-Date -Format t)"
+```
+
+The first line (before `---`) is the title; `href=` is opened when you click
+the alert; the first line after `---` shows under the title. Plugins run as
+you, in their own windowless processes, and are stopped after 10 s; only
+put scripts there that you trust.
 
 ## Good to know
 

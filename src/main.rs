@@ -17,6 +17,7 @@ mod memory;
 mod notifications;
 mod outputs;
 mod palette;
+mod plugins;
 mod render;
 mod settings;
 mod shelf;

@@ -23,6 +23,11 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 /// the volume in percent; `lparam` is 1 when muted.
 pub const WM_VOLUME: u32 = WM_APP + 4;
 
+/// Goes up each time Windows picks another default output device, so
+/// others following it (the peak meter) know to look again, without asking
+/// the audio service every so often (each ask is a cross-process call).
+pub static DEFAULT_DEVICE_GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// What the watcher thread waits for.
 enum Message {
     DefaultDeviceChanged,
@@ -229,6 +234,7 @@ struct DeviceWatcher {
 impl IMMNotificationClient_Impl for DeviceWatcher_Impl {
     fn OnDefaultDeviceChanged(&self, flow: EDataFlow, role: ERole, _id: &PCWSTR) -> Result<()> {
         if flow == eRender && role == eConsole {
+            DEFAULT_DEVICE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ = self.device_changed.send(Message::DefaultDeviceChanged);
         }
         Ok(())
