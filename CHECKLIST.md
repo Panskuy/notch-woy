@@ -4,12 +4,12 @@ Checklist kerja untuk proyek ini. Konteks arsitektur ada di [AGENT.md](AGENT.md)
 
 ## Pekerjaan yang masih terbuka (per 2026-10-29)
 
-- [ ] README masih menyebut `v0.1.0` (nama zip di bagian Install, judul
-      commit screenshot), padahal `Cargo.toml` dan tag git sudah `v0.2.0`.
+- [x] README masih menyebut `v0.1.0` di bagian Install: sekarang `v0.3.0`
+      (rilis 2026-10-31).
 - [ ] `dist/` sudah berisi `notch-woy-v0.2.0-windows-x64.zip` tetapi belum ada
       `dist/release-notes-v0.2.0.md`.
-- [ ] Pemilih perangkat output audio (`src/outputs.rs`, tombol di player)
-      belum disebut di README: tabel fitur maupun "Using it".
+- [x] Pemilih perangkat output audio (`src/outputs.rs`, tombol di player)
+      sudah disebut di README (fitur dan "Using it").
 - [ ] Belum ada screenshot pemilih output di `docs/`.
 - [x] Arah scroll ke Control Center tidak konsisten (README "scroll up",
       release notes v0.1.0 "scroll down"). Selesai dengan halaman kiri-kanan

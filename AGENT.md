@@ -7,7 +7,7 @@ Satu exe, tanpa framework GUI: semua digambar sendiri dengan `tiny-skia` lalu
 ditampilkan lewat layered window Win32.
 
 - Repo: https://github.com/Panskuy/notch-woy (lisensi MIT)
-- Versi di `Cargo.toml`: 0.2.0 (README dan rilis terakhir masih menyebut v0.1.0)
+- Versi di `Cargo.toml`: 0.3.0 (rilis GitHub terbaru v0.3.0)
 - Checklist kerja dan rilis: [CHECKLIST.md](CHECKLIST.md)
 - Rust edition 2024, target MSVC; hanya Windows
 

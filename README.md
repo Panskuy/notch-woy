@@ -11,6 +11,8 @@ media player, synced lyrics, and a Control Center when you hover it.
 - **Now playing** from any app that reports to Windows (Spotify, browsers,
   Media Player…): cover art, title, artist, a draggable progress bar, and
   previous / play-pause / next.
+- **Audio output picker** in the player: switch between speakers, headphones
+  and monitors without opening Windows' sound settings.
 - **Synced lyrics** from [LRCLIB](https://lrclib.net), scrolling with the song
   and lighting up word by word as it is sung (by the lyrics' own word timings
   when they have them, else spread over the line),
@@ -67,7 +69,7 @@ The screenshots are rendered from sample data.
 
 ## Install
 
-1. Download `notch-woy-v0.1.0-windows-x64.zip` from
+1. Download `notch-woy-v0.3.0-windows-x64.zip` from
    [Releases](https://github.com/Panskuy/notch-woy/releases).
 2. Unzip it anywhere and run `notch-woy.exe`.
 
@@ -91,6 +93,7 @@ Requires Windows 10 or 11, 64-bit.
 | On the shelf: mouse wheel | Scroll through the files, then on to the player |
 | Click or drag the progress bar | Seek |
 | Click 💬 | Show or hide lyrics |
+| Click the output button (right of the player's controls) | Pick the speakers, headphones or monitor to play through |
 | Click a notification | Open the app that sent it |
 | Control Center: the Now Playing module (off its play button) | Go to the player |
 | Control Center: the screens symbol under brightness (two or more screens) | Set each screen's brightness on its own; tap off the sheet to close it |
