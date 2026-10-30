@@ -22,6 +22,7 @@ use crate::media::{art_changed, track_changed, Command, NowPlaying};
 use crate::notifications::Toast;
 use crate::outputs::{Output, OutputKind};
 use crate::palette::Rgb;
+use crate::shelf::{self, Item};
 
 /// Notch size. The top edge sits flush with the screen.
 #[derive(Clone, Copy)]
@@ -98,9 +99,25 @@ const PROGRESS_GROW: f32 = 5.0;
 const PROGRESS_X0: f32 = 76.0;
 /// Progress bar's right end, from the player's right edge.
 const PROGRESS_RIGHT_INSET: f32 = 66.0;
-/// Kept clear of the page dots at the open notch's right edge.
-const DOTS_CLEARANCE: f32 = 14.0;
 const CONTROLS_Y: f32 = 118.0;
+/// The page dots' row, below the player's buttons and the other pages'
+/// modules and tiles.
+const PAGE_DOTS_Y: f32 = 144.0;
+/// Synced lyrics: size; how bright the part of the sung line still to
+/// come is (0 = as dim as the other lines, 1 = full); over how many
+/// characters each one brightens as it is sung (a soft edge rather than a
+/// hard one); and how far (logical px) a sung character rises.
+const LYRIC_SIZE: f32 = 13.5;
+const LYRIC_AHEAD: f32 = 0.3;
+const LYRIC_WIPE: f32 = 1.6;
+const LYRIC_LIFT: f32 = 1.0;
+/// The resting notch's clock: inset, size, and the gap before the cover.
+const CLOCK_X: f32 = 14.0;
+const CLOCK_SIZE: f32 = 13.0;
+const CLOCK_GAP: f32 = 8.0;
+/// How strong the cover gradient stays behind the shelf and Control Center,
+/// relative to behind the player.
+const SIDE_PAGE_TINT: f32 = 0.6;
 // Control centers in a `PANEL_W` player; wider players shift them to stay centered.
 const LYRICS_BUTTON_X: f32 = 53.0;
 const PREVIOUS_X: f32 = 92.0;
@@ -178,8 +195,20 @@ impl Fonts {
         })
     }
 
+    pub fn regular(&self) -> &Font {
+        &self.regular
+    }
+
+    pub fn semibold(&self) -> &Font {
+        &self.semibold
+    }
+
+    pub fn bold(&self) -> &Font {
+        &self.bold
+    }
+
     /// `font` must be one of this set's fonts.
-    fn glyph(&self, font: &Font, ch: char, px: f32) -> Rc<Glyph> {
+    pub fn glyph(&self, font: &Font, ch: char, px: f32) -> Rc<Glyph> {
         let key = (font as *const Font as usize, ch, px.to_bits());
         let mut glyphs = self.glyphs.borrow_mut();
         if let Some(glyph) = glyphs.get(&key) {
@@ -219,12 +248,134 @@ pub struct Scene<'a> {
     pub alert: Option<Alert>,
     /// The alert `alert` is replacing, and how far (0..1) the swap is.
     pub alert_from: Option<(Alert, f32)>,
-    /// Open notch page, animated: 0 = player, 1 = Control Center.
+    /// Open notch page, animated: -1 = shelf (left), 0 = player, 1 = Control
+    /// Center (right).
     pub page: f32,
     pub controls: ControlsView<'a>,
     /// Seconds on a running clock; drives the resting notch's equalizer.
     pub clock: f32,
+    /// The equalizers' bar heights (0..1) from the output's peak meter;
+    /// `None` and they animate on their own.
+    pub levels: Option<[f32; crate::meter::BARS]>,
+    /// The time of day, as Windows formats it (no seconds, no AM/PM), shown
+    /// on the left of the resting notch like the iPhone's status bar.
+    pub time: &'a str,
     pub outputs: OutputsView<'a>,
+    pub shelf: ShelfView<'a>,
+}
+
+/// The file shelf page, left of the player.
+#[derive(Clone, Copy, Default)]
+pub struct ShelfView<'a> {
+    /// Newest first.
+    pub items: &'a [Item],
+    /// First tile shown, fractional while it scrolls.
+    pub scroll: f32,
+    pub hover: Option<ShelfHit>,
+    pub pressed: Option<ShelfHit>,
+    /// How far the drop zone has lit up for files dragged over it, 0..1
+    /// (a spring: a little past 1 as it pops).
+    pub drop_glow: f32,
+    pub arrival: Option<Arrival>,
+}
+
+/// Files just dropped on the shelf.
+#[derive(Clone, Copy)]
+pub struct Arrival {
+    /// How many: the first tiles.
+    pub count: usize,
+    /// Seconds since the drop.
+    pub t: f32,
+    /// Where they were let go (logical canvas px): they fly from there.
+    pub from: (f32, f32),
+}
+
+/// Seconds a dropped file's icon takes to fly into its tile.
+const FLIGHT: f32 = 0.55;
+/// The drag image's size relative to a tile's icon, which a dropped file
+/// starts out at and springs down from.
+const FLIGHT_ZOOM: f32 = 1.45;
+/// The tiles already there slide over, quicker than the flight, so the
+/// new ones land in a free spot.
+const ARRIVAL_SHIFT: f32 = 0.28;
+/// Delay between successive dropped files' flights.
+const ARRIVAL_STAGGER: f32 = 0.07;
+/// Past this many, dropped files fly together (they land off the strip).
+const SHELF_MAX_STAGGERED: usize = 6;
+/// The ring of light spreading from a tile as its file lands.
+const RIPPLE: f32 = 0.45;
+/// How far into its flight a file touches down and its ripple starts.
+const TOUCHDOWN: f32 = 0.7;
+
+fn arrival_delay(index: usize) -> f32 {
+    ARRIVAL_STAGGER * index.min(SHELF_MAX_STAGGERED) as f32
+}
+
+/// Seconds until all of `count` dropped files have landed and rippled.
+pub fn shelf_arrival_length(count: usize) -> f32 {
+    arrival_delay(count.saturating_sub(1)) + (FLIGHT * TOUCHDOWN + RIPPLE).max(FLIGHT)
+}
+
+/// Where a shelf tile's icon is and how it shows, mid-flight or at rest.
+#[derive(Clone, Copy)]
+struct TileMotion {
+    /// Icon center.
+    icon: (f32, f32),
+    zoom: f32,
+    icon_alpha: f32,
+    /// The name and hover highlight; they show once the icon has landed.
+    label_alpha: f32,
+    /// The landing ripple's progress, 0..1, if it is spreading.
+    ripple: Option<f32>,
+}
+
+impl TileMotion {
+    fn at_rest(x: f32) -> Self {
+        let icon = (x + SHELF_TILE_W / 2.0, SHELF_ICON_Y + shelf::ICON / 2.0);
+        Self { icon, zoom: 1.0, icon_alpha: 1.0, label_alpha: 1.0, ripple: None }
+    }
+
+    /// A dropped file `t` seconds after the drop, the `index`-th of them,
+    /// flying from `from` into the tile at `x`. Like a drop on iOS or
+    /// macOS: the drag image curves from the pointer into its place,
+    /// springing down from its own size (a little under, then back), and
+    /// the name appears once it is down.
+    fn flying(x: f32, index: usize, t: f32, from: (f32, f32)) -> Self {
+        let rest = Self::at_rest(x);
+        let p = ((t - arrival_delay(index)) / FLIGHT).clamp(0.0, 1.0);
+        if p >= 1.0 && t - arrival_delay(index) >= FLIGHT * TOUCHDOWN + RIPPLE {
+            return rest;
+        }
+        // Several files leave the pointer as a fanned stack, as dragged.
+        let from = (from.0 + 5.0 * index.min(3) as f32, from.1 + 3.0 * index.min(3) as f32);
+        // Kept low enough that the enlarged image is not cut off by the top
+        // of the screen.
+        let from = (from.0, from.1.max(shelf::ICON * FLIGHT_ZOOM / 2.0 + 4.0));
+        // A swoop: sideways first, then down into the tile.
+        let e = ease_out_cubic(p);
+        let control = (rest.icon.0, from.1);
+        let bezier = |a: f32, c: f32, b: f32| (1.0 - e) * (1.0 - e) * a + 2.0 * (1.0 - e) * e * c + e * e * b;
+        let icon = (bezier(from.0, control.0, rest.icon.0), bezier(from.1, control.1, rest.icon.1));
+        let zoom = FLIGHT_ZOOM + (1.0 - FLIGHT_ZOOM) * ease_out_back(p);
+        let since_touchdown = t - arrival_delay(index) - FLIGHT * TOUCHDOWN;
+        Self {
+            icon,
+            zoom,
+            icon_alpha: (p * 5.0).min(1.0),
+            label_alpha: ((p - TOUCHDOWN) / (1.0 - TOUCHDOWN)).clamp(0.0, 1.0),
+            ripple: (since_touchdown >= 0.0).then(|| (since_touchdown / RIPPLE).min(1.0)),
+        }
+    }
+}
+
+/// What is under the pointer on the shelf page.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ShelfHit {
+    Item(usize),
+    /// The little x on a hovered tile.
+    Remove(usize),
+    Share,
+    Clear,
 }
 
 /// The player's audio output picker.
@@ -325,8 +476,10 @@ pub enum LyricsView<'a> {
     Missing,
     Plain(&'a [Line]),
     /// `scroll` is the (animated, fractional) index of the line being sung,
-    /// -1 before the first one.
-    Synced { lines: &'a [Line], scroll: f32 },
+    /// -1 before the first one. `sung`: that line's index and how many of
+    /// its characters have been sung (fractional), to light it up word by
+    /// word.
+    Synced { lines: &'a [Line], scroll: f32, sung: Option<(usize, f32)> },
 }
 
 /// Something clickable in the open notch.
@@ -362,15 +515,9 @@ impl Layout {
         }
     }
 
-    /// Extra room on the player's right while it reaches the notch's edge
-    /// (lyrics hidden), where the page dots sit.
-    fn dots_clearance(&self) -> f32 {
-        DOTS_CLEARANCE * (1.0 - self.lyrics)
-    }
-
     /// Left and right ends of the progress bar.
     fn progress_span(&self) -> (f32, f32) {
-        (self.left + PROGRESS_X0, self.left + self.player - PROGRESS_RIGHT_INSET - self.dots_clearance())
+        (self.left + PROGRESS_X0, self.left + self.player - PROGRESS_RIGHT_INSET)
     }
 
     /// Shift that keeps the controls centered in a player wider than `PANEL_W`.
@@ -522,29 +669,37 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
     // into its range (a notification card) keeps them hidden.
     let t = expansion(shape);
     let expanded_alpha = ((t - 0.35) / 0.65).clamp(0.0, 1.0) * (1.0 - alert_alpha);
-    // The cover gradient belongs to the music page with lyrics showing; it
-    // fades with the lyrics panel and scrolls away with the page.
-    let page = scene.page.clamp(0.0, 1.0);
+    // -1 shelf, 0 player, 1 Control Center.
+    let page = scene.page.clamp(-1.0, 1.0);
+    // The cover gradient comes with the lyrics panel. It is the backdrop of
+    // the whole open notch, not of the player page: it stays put while the
+    // pages slide over it (no hard edge between a tinted and a black page),
+    // a little dimmer behind the side pages, whose glass modules take on
+    // its color.
     // The output picker covers the player, gradient and all.
     let picker = scene.outputs.reveal.clamp(0.0, 1.0);
-    let gradient_alpha = expanded_alpha * scene.lyrics_reveal.clamp(0.0, 1.0) * (1.0 - picker);
-    if gradient_alpha > 0.0 && scene.page < 1.0 {
-        let shift = scene.page * PAGE_TRAVEL;
-        background(pixmap, &path, ts, shape.height, shift, media, transition, gradient_alpha);
+    let side = page.abs();
+    let backdrop = 1.0 - (1.0 - SIDE_PAGE_TINT) * side;
+    let gradient_alpha =
+        expanded_alpha * scene.lyrics_reveal.clamp(0.0, 1.0) * (1.0 - picker * (1.0 - side)) * backdrop;
+    if gradient_alpha > 0.0 {
+        background(pixmap, &path, ts, shape.height, media, transition, gradient_alpha);
     }
 
     // Content is clipped to the notch so it is revealed as the shape grows.
     let Some(mut clip) = Mask::new(pixmap.width(), pixmap.height()) else { return };
     clip.fill_path(&path, FillRule::Winding, true, ts);
 
-    let mut canvas = Canvas { pixmap, clip: &clip, scale, fonts, dy: 0.0 };
+    let mut canvas = Canvas { pixmap, clip: &clip, scale, fonts, dx: 0.0, dy: 0.0 };
     let (left, right) = ((canvas_w - shape.width) / 2.0, (canvas_w + shape.width) / 2.0);
 
     // The resting content fades out as the notch shrinks into its mini pill.
     let unshrunk = ((shape.width - MINI.width) / (scene.rest_width - MINI.width)).clamp(0.0, 1.0);
     let collapsed_alpha = (1.0 - t * 3.0).clamp(0.0, 1.0) * (1.0 - alert_alpha) * unshrunk * unshrunk;
     if collapsed_alpha > 0.0 {
-        canvas.collapsed(media, transition, scene.battery, scene.bluetooth, scene.clock, left, right, collapsed_alpha);
+        let indicators = (scene.battery, scene.bluetooth);
+        let equalizer = (scene.clock, scene.levels);
+        canvas.collapsed(media, transition, indicators, equalizer, scene.time, left, right, collapsed_alpha);
     }
 
     if let Some(alert) = scene.alert.as_ref().filter(|_| alert_alpha > 0.0) {
@@ -554,27 +709,30 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
             Some((from, p)) => {
                 let (out, incoming) = (Phase::outgoing(*p), Phase::incoming(*p));
                 canvas.dy = out.dy;
-                canvas.alert(from, left, right, alert_alpha * out.alpha);
+                canvas.alert(from, scene.levels, left, right, alert_alpha * out.alpha);
                 canvas.dy = incoming.dy;
-                canvas.alert(alert, left, right, alert_alpha * incoming.alpha);
+                canvas.alert(alert, scene.levels, left, right, alert_alpha * incoming.alpha);
                 canvas.dy = 0.0;
             }
-            None => canvas.alert(alert, left, right, alert_alpha),
+            None => canvas.alert(alert, scene.levels, left, right, alert_alpha),
         }
     }
 
     if expanded_alpha > 0.0 {
         let layout = Layout::new(canvas_w, scene.panel_width, scene.lyrics_reveal);
-        // Pages sit one above the other, Control Center on top, and scroll
-        // as one, a full page per turn, the notch's edge cutting them off;
-        // no fading.
-        // Positions follow the raw value, which a touchpad can stretch a
-        // little past either page (rubber band).
+        // Pages sit side by side, edge to edge, the shelf on the left, the
+        // player in the middle, Control Center on the right, each centered
+        // and as wide as it needs; they slide as one while the notch's width
+        // follows, its edge cutting them off; no fading. Positions follow
+        // the raw value, which a touchpad can stretch a little past either
+        // end (rubber band).
         let raw = scene.page;
-        let p = page;
-        if raw < 1.0 {
+        let controls_x = (layout.width + CONTROLS_WIDTH) / 2.0;
+        let shelf_x = -(layout.width + shelf_width(scene.shelf.items.len())) / 2.0;
+        let view = if raw >= 0.0 { raw * controls_x } else { -raw * shelf_x };
+        if raw < 1.0 && raw > -1.0 {
             let a = expanded_alpha;
-            canvas.dy = raw * PAGE_TRAVEL;
+            canvas.dx = -view;
             // The player dims away behind the sheet growing over it.
             let fade = (1.0 - picker * 1.3).clamp(0.0, 1.0);
             if fade > 0.0 {
@@ -585,11 +743,16 @@ pub fn draw(pixmap: &mut Pixmap, scale: f32, scene: &Scene, fonts: Option<&Fonts
             }
         }
         if raw > 0.0 {
-            canvas.dy = -(1.0 - raw) * PAGE_TRAVEL;
-            canvas.control_center(&scene.controls, layout.left, layout.width, expanded_alpha);
+            canvas.dx = controls_x - view;
+            let left = (canvas_w - CONTROLS_WIDTH) / 2.0;
+            canvas.control_center(&scene.controls, left, CONTROLS_WIDTH, expanded_alpha);
         }
-        canvas.dy = 0.0;
-        canvas.page_dots(layout.left + layout.width - 10.0, p, expanded_alpha);
+        if raw < 0.0 {
+            canvas.dx = shelf_x - view;
+            canvas.shelf(&scene.shelf, canvas_w, scene.clock, expanded_alpha);
+        }
+        canvas.dx = 0.0;
+        canvas.page_dots(canvas_w / 2.0, page, expanded_alpha);
     }
 }
 
@@ -601,7 +764,6 @@ fn background(
     path: &Path,
     ts: Transform,
     height: f32,
-    shift: f32,
     media: Option<&NowPlaying>,
     transition: Option<&Transition>,
     alpha: f32,
@@ -611,23 +773,12 @@ fn background(
     let mut paint_gradient = |tint: Rgb, a: f32| {
         let alpha = (a * 255.0) as u8;
         let black = Color::from_rgba8(0, 0, 0, alpha);
-        let clear = Color::from_rgba8(tint[0], tint[1], tint[2], 0);
         let tint = Color::from_rgba8(tint[0], tint[1], tint[2], alpha);
-        // Moves with the page; outside it (the other page scrolling in) is
-        // left clear.
-        let span = height + 2.0;
-        let (start, end) = (1.0 / span, (height + 1.0) / span);
         let shader = LinearGradient::new(
-            Point::from_xy(0.0, shift - 1.0),
-            Point::from_xy(0.0, shift + height + 1.0),
+            Point::from_xy(0.0, 0.0),
+            Point::from_xy(0.0, height),
             // Solid black across the top third, where the notch meets the bezel.
-            vec![
-                GradientStop::new(0.0, clear),
-                GradientStop::new(start, black),
-                GradientStop::new(start + 0.3 * height / span, black),
-                GradientStop::new(end, tint),
-                GradientStop::new(1.0, clear),
-            ],
+            vec![GradientStop::new(0.0, black), GradientStop::new(0.3, black), GradientStop::new(1.0, tint)],
             SpreadMode::Pad,
             Transform::identity(),
         );
@@ -683,10 +834,140 @@ pub fn button_at(
     .map(|(button, _)| button)
 }
 
+/// The shelf page's parts, for `count` files in an open notch as wide as
+/// they need (`shelf_width`).
+struct ShelfGeometry {
+    left: f32,
+    width: f32,
+    /// Where the first tile sits, unscrolled: the tiles are centered while
+    /// they fit.
+    first: f32,
+}
+
+const SHELF_TOP: f32 = 44.0;
+const SHELF_TILE_W: f32 = 76.0;
+const SHELF_STEP: f32 = 80.0;
+const SHELF_TILE_H: f32 = 92.0;
+const SHELF_ICON_Y: f32 = SHELF_TOP + 6.0;
+const SHELF_BUTTON_Y: f32 = 25.0;
+const SHELF_BUTTON_R: f32 = 13.0;
+
+/// The tile strip's inset from the shelf page's sides.
+const SHELF_PAD: f32 = 18.0;
+/// The shelf page is never narrower than this, so the empty drop zone's
+/// hint fits, nor wider than the widest open notch for the player.
+const SHELF_MIN_W: f32 = 400.0;
+const SHELF_MAX_W: f32 = EXPANDED.width;
+
+/// Width of the open notch on the shelf page: snug around its files.
+pub fn shelf_width(count: usize) -> f32 {
+    let tiles = count as f32 * SHELF_STEP - (SHELF_STEP - SHELF_TILE_W);
+    (2.0 * SHELF_PAD + tiles).clamp(SHELF_MIN_W, SHELF_MAX_W)
+}
+
+/// Width of the open notch on the Control Center page: wider than the
+/// player, so the Now Playing and Bluetooth modules have room for names.
+pub const CONTROLS_WIDTH: f32 = 560.0;
+
+/// The open notch's width on `page` (-1 shelf, 0 player, 1 Control
+/// Center), for a player `player` wide and `shelf_count` files; between two
+/// pages (a touchpad drag) it goes from one width to the other.
+pub fn open_width(player: f32, page: f32, shelf_count: usize) -> f32 {
+    let page = page.clamp(-1.0, 1.0);
+    let side = if page >= 0.0 { CONTROLS_WIDTH } else { shelf_width(shelf_count) };
+    player + (side - player) * page.abs()
+}
+
+impl ShelfGeometry {
+    fn new(canvas_w: f32, count: usize) -> Self {
+        let width = shelf_width(count);
+        let left = (canvas_w - width) / 2.0;
+        let mut g = Self { left, width, first: left + SHELF_PAD };
+        if count <= g.visible() {
+            let (x0, x1) = g.strip();
+            let tiles = count as f32 * SHELF_STEP - (SHELF_STEP - SHELF_TILE_W);
+            g.first = x0 + ((x1 - x0 - tiles) / 2.0).max(0.0);
+        }
+        g
+    }
+
+    /// Left and right ends of the tile strip.
+    fn strip(&self) -> (f32, f32) {
+        (self.left + SHELF_PAD, self.left + self.width - SHELF_PAD)
+    }
+
+    /// Tiles that fit side by side.
+    fn visible(&self) -> usize {
+        let (x0, x1) = self.strip();
+        (((x1 - x0 + SHELF_STEP - SHELF_TILE_W) / SHELF_STEP) as usize).max(1)
+    }
+
+    fn tile_x(&self, index: usize, scroll: f32) -> f32 {
+        self.first + (index as f32 - scroll) * SHELF_STEP
+    }
+
+    fn share_center(&self) -> (f32, f32) {
+        (self.left + self.width - 68.0, SHELF_BUTTON_Y)
+    }
+
+    fn clear_center(&self) -> (f32, f32) {
+        (self.left + self.width - 38.0, SHELF_BUTTON_Y)
+    }
+
+    /// The remove button of a tile at `tile_x`.
+    fn remove_center(tile_x: f32) -> (f32, f32) {
+        (tile_x + (SHELF_TILE_W + shelf::ICON) / 2.0 - 2.0, SHELF_ICON_Y + 2.0)
+    }
+}
+
+/// How far the shelf can scroll with `count` files.
+pub fn shelf_max_scroll(canvas_width: u32, scale: f32, count: usize) -> f32 {
+    let geometry = ShelfGeometry::new(canvas_width as f32 / scale, count);
+    count.saturating_sub(geometry.visible()) as f32
+}
+
+/// What is at (x, y) (physical px) on the shelf page.
+pub fn shelf_at(
+    canvas_width: u32,
+    scale: f32,
+    count: usize,
+    scroll: f32,
+    (x, y): (f32, f32),
+) -> Option<ShelfHit> {
+    let (x, y) = (x / scale, y / scale);
+    let g = ShelfGeometry::new(canvas_width as f32 / scale, count);
+    let near = |(cx, cy): (f32, f32), r: f32| (x - cx).hypot(y - cy) <= r;
+    if count > 0 {
+        if near(g.share_center(), SHELF_BUTTON_R) {
+            return Some(ShelfHit::Share);
+        }
+        if near(g.clear_center(), SHELF_BUTTON_R) {
+            return Some(ShelfHit::Clear);
+        }
+    }
+    let (x0, x1) = g.strip();
+    if x < x0 || x > x1 || !(SHELF_TOP..SHELF_TOP + SHELF_TILE_H).contains(&y) {
+        return None;
+    }
+    let index = ((x - g.first) / SHELF_STEP + scroll).floor();
+    if index < 0.0 || index as usize >= count {
+        return None;
+    }
+    let index = index as usize;
+    let tile_x = g.tile_x(index, scroll);
+    if x > tile_x + SHELF_TILE_W {
+        return None;
+    }
+    if near(ShelfGeometry::remove_center(tile_x), 9.0) {
+        return Some(ShelfHit::Remove(index));
+    }
+    Some(ShelfHit::Item(index))
+}
+
 /// Left and right ends of the output picker's rows in an open notch at
-/// `left`, `width` wide; clear of the page dots.
+/// `left`, `width` wide.
 fn output_row_span(left: f32, width: f32) -> (f32, f32) {
-    (left + 16.0, left + width - 24.0)
+    (left + 16.0, left + width - 16.0)
 }
 
 /// Which output picker row is under a point in physical canvas pixels;
@@ -702,9 +983,6 @@ pub fn output_at(canvas_width: u32, scale: f32, panel_width: f32, scroll: f32, c
     let index = ((y - OUTPUT_TOP) / OUTPUT_ROW_H + scroll).floor();
     (index >= 0.0 && (index as usize) < count).then_some(index as usize)
 }
-
-/// How far (logical px) a page travels while sliding in or out.
-const PAGE_TRAVEL: f32 = EXPANDED.height;
 
 // Control Center layout, relative to the open notch's left edge, after iOS:
 // a connectivity module with four round toggles, two tall sliders, and on
@@ -783,13 +1061,13 @@ fn lerp_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
 
 /// What on the Control Center page is under a point in physical canvas
 /// pixels.
-pub fn control_at(canvas_width: u32, scale: f32, panel_width: f32, (x, y): (f32, f32)) -> Option<ControlHit> {
-    let left = (canvas_width as f32 / scale - panel_width) / 2.0;
+pub fn control_at(canvas_width: u32, scale: f32, (x, y): (f32, f32)) -> Option<ControlHit> {
+    let left = (canvas_width as f32 / scale - CONTROLS_WIDTH) / 2.0;
     let (x, y) = (x / scale - left, y / scale);
     if let Some((toggle, _, _)) = toggles().into_iter().find(|&(_, cx, cy)| (x - cx).hypot(y - cy) <= TOGGLE_RADIUS) {
         return Some(ControlHit::Toggle(toggle));
     }
-    let modules_w = modules_width(panel_width);
+    let modules_w = modules_width(CONTROLS_WIDTH);
     let media_right = MODULES_X + modules_w;
     let on_media_button = x >= media_right - MEDIA_BUTTON_W && x <= media_right && y >= CC_TOP && y <= CC_TOP + MODULE_H;
     if modules_w >= MODULES_MIN_W && on_media_button {
@@ -913,7 +1191,7 @@ impl ToastLayout {
 /// Cubic Bezier approximation of a quarter circle.
 const KAPPA: f32 = 0.552_284_8;
 
-fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
+pub fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
     let r = r.min(w / 2.0).min(h / 2.0);
     let k = r * KAPPA;
     let (rt, b) = (x + w, y + h);
@@ -936,14 +1214,16 @@ struct Canvas<'a> {
     clip: &'a Mask,
     scale: f32,
     fonts: Option<&'a Fonts>,
-    /// Vertical offset (logical px) for everything drawn; slides pages.
+    /// Offset (logical px) for everything drawn; slides pages sideways
+    /// (`dx`) and content in and out (`dy`).
+    dx: f32,
     dy: f32,
 }
 
 impl Canvas<'_> {
     /// Logical to physical pixels, with the page offset.
     fn transform(&self) -> Transform {
-        Transform::from_row(self.scale, 0.0, 0.0, self.scale, 0.0, self.dy * self.scale)
+        Transform::from_row(self.scale, 0.0, 0.0, self.scale, self.dx * self.scale, self.dy * self.scale)
     }
 
     /// The Control Center page: connectivity module, brightness and volume
@@ -1091,16 +1371,20 @@ impl Canvas<'_> {
         }
         self.device_icon(kind, icon_x, mid, icon_alpha);
         let Some(fonts) = fonts else { return };
+        let connected = |d: &Device| match d.battery {
+            Some(level) => format!("Connected · {level}%"),
+            None => "Connected".to_string(),
+        };
         let (title, detail) = match (device, view.state.bluetooth) {
-            (Some(d), _) => (d.name.as_str(), "Connected"),
-            (None, Some(true)) => ("Bluetooth", "Not connected"),
-            (None, Some(false)) => ("Bluetooth", "Off"),
-            (None, None) => ("Bluetooth", "Unavailable"),
+            (Some(d), _) => (d.name.as_str(), connected(d)),
+            (None, Some(true)) => ("Bluetooth", "Not connected".to_string()),
+            (None, Some(false)) => ("Bluetooth", "Off".to_string()),
+            (None, None) => ("Bluetooth", "Unavailable".to_string()),
         };
         let text_x = icon_x + 22.0;
         let max = x + w - 12.0 - text_x;
         self.text(&fonts.semibold, title, 12.5, text_x, mid - 2.0, max, WHITE, alpha);
-        self.text(&fonts.regular, detail, 11.0, text_x, mid + 12.0, max, GRAY, alpha);
+        self.text(&fonts.regular, &detail, 11.0, text_x, mid + 12.0, max, GRAY, alpha);
     }
 
     /// A tall capsule that fills from the bottom, its symbol at the foot.
@@ -1136,7 +1420,7 @@ impl Canvas<'_> {
         // Drawn into a scratch layer, then tinted: the speaker paths are
         // white-only, and this keeps them in one place.
         let Some(mut layer) = Pixmap::new(self.pixmap.width(), self.pixmap.height()) else { return };
-        let mut scratch = Canvas { pixmap: &mut layer, clip: self.clip, scale: self.scale, fonts: self.fonts, dy: self.dy };
+        let mut scratch = Canvas { pixmap: &mut layer, clip: self.clip, scale: self.scale, fonts: self.fonts, dx: self.dx, dy: self.dy };
         scratch.speaker_icon(x, cy, level, muted, 1.0);
         for px in layer.data_mut().chunks_exact_mut(4) {
             // Premultiplied white becomes premultiplied near-black.
@@ -1150,13 +1434,290 @@ impl Canvas<'_> {
         self.pixmap.draw_pixmap(0, 0, layer.as_ref(), &paint, Transform::identity(), None);
     }
 
-    /// Two vertical dots on the right edge, the current page's bright.
-    fn page_dots(&mut self, x: f32, page: f32, alpha: f32) {
-        for (i, y) in [70.0, 80.0].into_iter().enumerate() {
+    /// The shelf page: a header with Share and Clear, then the files as
+    /// tiles (thumbnail or icon, name), or a drop zone while it is empty or
+    /// files are dragged over.
+    fn shelf(&mut self, view: &ShelfView, canvas_w: f32, clock: f32, alpha: f32) {
+        let Some(fonts) = self.fonts else { return };
+        let count = view.items.len();
+        let g = ShelfGeometry::new(canvas_w, count);
+        let title = match count {
+            0 => "Shelf".to_string(),
+            1 => "Shelf \u{b7} 1 file".to_string(),
+            n => format!("Shelf \u{b7} {n} files"),
+        };
+        self.text(&fonts.semibold, &title, 13.0, g.left + 22.0, SHELF_BUTTON_Y + 4.5, 200.0, WHITE, alpha);
+        if count > 0 {
+            for (hit, (cx, cy)) in [(ShelfHit::Share, g.share_center()), (ShelfHit::Clear, g.clear_center())] {
+                let lit = view.hover == Some(hit) || view.pressed == Some(hit);
+                if let Some(disc) = PathBuilder::from_circle(cx, cy, SHELF_BUTTON_R) {
+                    self.fill(&disc, WHITE, alpha * if lit { 0.22 } else { 0.12 });
+                }
+                match hit {
+                    ShelfHit::Share => self.share_icon(cx, cy, alpha),
+                    _ => self.trash_icon(cx, cy, alpha),
+                }
+            }
+        }
+
+        // The drop zone: always there while the shelf is empty; over the
+        // tiles only while files are dragged over it. It lights up blue
+        // and swells a little (with the spring's pop), its dashes march
+        // round, and an arrow bobs into a tray.
+        let pop = view.drop_glow.max(0.0);
+        let glow = pop.min(1.0);
+        // One after the other, not over each other: what was showing fades
+        // out over the first part of the glow, the drop prompt in over the
+        // rest.
+        let (before, after) = ((1.0 - glow / 0.45).clamp(0.0, 1.0), ((glow - 0.45) / 0.55).clamp(0.0, 1.0));
+        let (x0, x1) = g.strip();
+        let zone_alpha = alpha * if count == 0 { 1.0 } else { glow };
+        if zone_alpha > 0.01 {
+            let grow = 3.0 * pop;
+            let (w, h) = (x1 - x0 + 2.0 * grow, SHELF_TILE_H - 4.0 + 2.0 * grow);
+            if let Some(zone) = rounded_rect(x0 - grow, SHELF_TOP - grow, w, h, 14.0 + grow) {
+                self.fill(&zone, BLUE, zone_alpha * 0.18 * glow);
+                let rgb = lerp_rgb(WHITE, BLUE, glow);
+                self.dashed(&zone, rgb, zone_alpha * (0.35 + 0.55 * glow), -clock * 14.0 * glow);
+            }
+            let cx = (x0 + x1) / 2.0;
+            let bob = (clock * 5.0).sin() * 2.5 * glow;
+            let arrow = if count == 0 { 1.0 } else { after };
+            self.tray_arrow(cx, SHELF_TOP + 22.0, bob, lerp_rgb(GRAY, BLUE, glow), zone_alpha * arrow);
+            // The empty shelf's own hint shows only while it is empty.
+            let idle = if count == 0 { before } else { 0.0 };
+            let lines = [
+                ("Drop files here", "Drag one out to move it; until then it stays where it is", idle),
+                ("Drop to add to the shelf", "The files stay where they are", after),
+            ];
+            for (line1, line2, a) in lines {
+                if a > 0.01 {
+                    let a = alpha * a;
+                    self.text_centered(&fonts.semibold, line1, 14.0, cx, SHELF_TOP + 51.0, WHITE, a);
+                    self.text_centered(&fonts.regular, line2, 11.5, cx, SHELF_TOP + 68.0, GRAY, a);
+                }
+            }
+        }
+        if count == 0 {
+            return;
+        }
+        let tiles_alpha = alpha * before;
+
+        for (i, item) in view.items.iter().enumerate() {
+            let mut x = g.tile_x(i, view.scroll);
+            // Just dropped: the new files fly in, one after another, while
+            // the ones already there slide over to make room. In flight they
+            // are not held back by the drop zone fading out.
+            let (motion, base) = match view.arrival {
+                Some(arrival) if i < arrival.count => (TileMotion::flying(x, i, arrival.t, arrival.from), alpha),
+                Some(arrival) => {
+                    let p = (arrival.t / ARRIVAL_SHIFT).clamp(0.0, 1.0);
+                    x -= arrival.count as f32 * SHELF_STEP * (1.0 - ease_out_cubic(p));
+                    (TileMotion::at_rest(x), tiles_alpha)
+                }
+                None => (TileMotion::at_rest(x), tiles_alpha),
+            };
+            // Tiles fade out as they scroll past either end of the strip.
+            let overflow = (x0 - x).max(x + SHELF_TILE_W - x1).max(0.0);
+            let a = base * (1.0 - overflow / SHELF_TILE_W).clamp(0.0, 1.0);
+            if a <= 0.01 {
+                continue;
+            }
+            self.shelf_tile(view, i, item, x, motion, a);
+        }
+    }
+
+    /// One file's tile at `x`: highlight, icon (where `motion` puts it),
+    /// name, and its remove button while hovered.
+    fn shelf_tile(&mut self, view: &ShelfView, i: usize, item: &Item, x: f32, motion: TileMotion, alpha: f32) {
+        let Some(fonts) = self.fonts else { return };
+        let hovered = matches!(view.hover, Some(ShelfHit::Item(j) | ShelfHit::Remove(j)) if j == i);
+        let pressed = matches!(view.pressed, Some(ShelfHit::Item(j)) if j == i);
+        let tile = rounded_rect(x, SHELF_TOP, SHELF_TILE_W, SHELF_TILE_H - 4.0, 12.0);
+        // Landing: the tile flashes and a ring of light spreads from the
+        // icon and fades.
+        if let Some(r) = motion.ripple.filter(|&r| r < 1.0) {
+            let fade = 1.0 - ease_out_cubic(r);
+            if let Some(tile) = &tile {
+                self.fill(tile, WHITE, alpha * 0.14 * fade);
+            }
+            let radius = shelf::ICON / 2.0 + 2.0 + 16.0 * ease_out_cubic(r);
+            if let Some(ring) = PathBuilder::from_circle(motion.icon.0, motion.icon.1, radius) {
+                self.stroke(&ring, 1.0 + 1.5 * fade, WHITE, alpha * 0.3 * fade);
+            }
+        }
+        let a = alpha * motion.label_alpha;
+        if (hovered || pressed)
+            && let Some(tile) = &tile
+        {
+            self.fill(tile, WHITE, a * if pressed { 0.16 } else { 0.09 });
+        }
+        let (cx, cy) = motion.icon;
+        let icon_alpha = alpha * motion.icon_alpha;
+        match &item.icon {
+            Some(icon) => self.icon_image(icon, cx, cy, motion.zoom, icon_alpha),
+            None => self.document_glyph(cx, cy, motion.zoom, icon_alpha),
+        }
+        if a <= 0.01 {
+            return;
+        }
+        let lines = wrap(&fonts.regular, &item.name, 11.0 * self.scale, (SHELF_TILE_W - 4.0) * self.scale, 2);
+        for (row, line) in lines.iter().enumerate() {
+            let baseline = SHELF_ICON_Y + shelf::ICON + 14.0 + row as f32 * 13.0;
+            self.text_centered(&fonts.regular, line, 11.0, x + SHELF_TILE_W / 2.0, baseline, WHITE, a * 0.9);
+        }
+        if hovered {
+            let (cx, cy) = ShelfGeometry::remove_center(x);
+            let lit = view.hover == Some(ShelfHit::Remove(i));
+            if let Some(disc) = PathBuilder::from_circle(cx, cy, 8.0) {
+                self.fill(&disc, if lit { [90, 90, 94] } else { [60, 60, 64] }, a);
+            }
+            self.cross(cx, cy, 2.8, 1.5, WHITE, a);
+        }
+    }
+
+    /// An arrow pointing down into an open tray, centered on (cx, cy); the
+    /// arrow lifted by `bob` (the tray stays put).
+    fn tray_arrow(&mut self, cx: f32, cy: f32, bob: f32, rgb: Rgb, alpha: f32) {
+        let mut pb = PathBuilder::new();
+        let (top, tip) = (cy - 11.0 + bob, cy + 2.0 + bob);
+        pb.move_to(cx, top);
+        pb.line_to(cx, tip);
+        pb.move_to(cx - 5.0, tip - 5.0);
+        pb.line_to(cx, tip);
+        pb.line_to(cx + 5.0, tip - 5.0);
+        if let Some(arrow) = pb.finish() {
+            self.stroke(&arrow, 2.0, rgb, alpha);
+        }
+        let mut pb = PathBuilder::new();
+        pb.move_to(cx - 11.0, cy + 1.0);
+        pb.line_to(cx - 11.0, cy + 8.0);
+        pb.line_to(cx + 11.0, cy + 8.0);
+        pb.line_to(cx + 11.0, cy + 1.0);
+        if let Some(tray) = pb.finish() {
+            self.stroke(&tray, 2.0, rgb, alpha);
+        }
+    }
+
+    /// `img` (drawn at the display's scale) centered on (cx, cy), scaled by
+    /// `zoom`, keeping its aspect.
+    fn icon_image(&mut self, img: &Pixmap, cx: f32, cy: f32, zoom: f32, alpha: f32) {
+        let k = zoom / self.scale;
+        let (w, h) = (img.width() as f32 * k, img.height() as f32 * k);
+        let (x, y) = (cx - w / 2.0, cy - h / 2.0);
+        let Some(rect) = Rect::from_xywh(x, y, w, h) else { return };
+        let paint = Paint {
+            shader: Pattern::new(
+                img.as_ref(),
+                SpreadMode::Pad,
+                FilterQuality::Bilinear,
+                alpha,
+                Transform::from_row(k, 0.0, 0.0, k, x, y),
+            ),
+            anti_alias: true,
+            ..Default::default()
+        };
+        let ts = self.transform();
+        self.pixmap.fill_path(&PathBuilder::from_rect(rect), &paint, FillRule::Winding, ts, Some(self.clip));
+    }
+
+    /// A plain page with a folded corner, while a file's icon loads.
+    fn document_glyph(&mut self, cx: f32, cy: f32, zoom: f32, alpha: f32) {
+        let (w, h, fold) = (28.0 * zoom, 36.0 * zoom, 9.0 * zoom);
+        let (x, y) = (cx - w / 2.0, cy - h / 2.0);
+        let mut pb = PathBuilder::new();
+        pb.move_to(x, y);
+        pb.line_to(x + w - fold, y);
+        pb.line_to(x + w, y + fold);
+        pb.line_to(x + w, y + h);
+        pb.line_to(x, y + h);
+        pb.close();
+        if let Some(page) = pb.finish() {
+            self.fill(&page, WHITE, alpha * 0.85);
+        }
+    }
+
+    /// Square with an arrow out of its top, as on Apple's share buttons.
+    fn share_icon(&mut self, cx: f32, cy: f32, alpha: f32) {
+        let mut pb = PathBuilder::new();
+        pb.move_to(cx - 2.5, cy - 2.0);
+        pb.line_to(cx - 5.5, cy - 2.0);
+        pb.line_to(cx - 5.5, cy + 6.0);
+        pb.line_to(cx + 5.5, cy + 6.0);
+        pb.line_to(cx + 5.5, cy - 2.0);
+        pb.line_to(cx + 2.5, cy - 2.0);
+        pb.move_to(cx, cy + 2.0);
+        pb.line_to(cx, cy - 7.0);
+        pb.move_to(cx - 3.0, cy - 4.0);
+        pb.line_to(cx, cy - 7.0);
+        pb.line_to(cx + 3.0, cy - 4.0);
+        if let Some(path) = pb.finish() {
+            self.stroke(&path, 1.6, WHITE, alpha);
+        }
+    }
+
+    /// A bin: lid with a handle, and a tapered body with two ribs.
+    fn trash_icon(&mut self, cx: f32, cy: f32, alpha: f32) {
+        let mut pb = PathBuilder::new();
+        pb.move_to(cx - 6.0, cy - 4.0);
+        pb.line_to(cx + 6.0, cy - 4.0);
+        pb.move_to(cx - 2.0, cy - 4.0);
+        pb.line_to(cx - 2.0, cy - 6.0);
+        pb.line_to(cx + 2.0, cy - 6.0);
+        pb.line_to(cx + 2.0, cy - 4.0);
+        pb.move_to(cx - 4.5, cy - 4.0);
+        pb.line_to(cx - 3.8, cy + 6.0);
+        pb.line_to(cx + 3.8, cy + 6.0);
+        pb.line_to(cx + 4.5, cy - 4.0);
+        pb.move_to(cx - 1.4, cy - 1.0);
+        pb.line_to(cx - 1.2, cy + 3.5);
+        pb.move_to(cx + 1.4, cy - 1.0);
+        pb.line_to(cx + 1.2, cy + 3.5);
+        if let Some(path) = pb.finish() {
+            self.stroke(&path, 1.5, WHITE, alpha);
+        }
+    }
+
+    /// An x, `r` from center to each tip.
+    #[allow(clippy::too_many_arguments)]
+    fn cross(&mut self, cx: f32, cy: f32, r: f32, width: f32, rgb: Rgb, alpha: f32) {
+        let mut pb = PathBuilder::new();
+        pb.move_to(cx - r, cy - r);
+        pb.line_to(cx + r, cy + r);
+        pb.move_to(cx + r, cy - r);
+        pb.line_to(cx - r, cy + r);
+        if let Some(path) = pb.finish() {
+            self.stroke(&path, width, rgb, alpha);
+        }
+    }
+
+    /// A dashed outline, as macOS draws drop zones.
+    /// Strokes `path` dashed; `phase` (logical px) moves the dashes along.
+    fn dashed(&mut self, path: &Path, rgb: Rgb, alpha: f32, phase: f32) {
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_rgba8(rgb[0], rgb[1], rgb[2], (alpha.clamp(0.0, 1.0) * 255.0) as u8));
+        paint.anti_alias = true;
+        let stroke = Stroke {
+            width: 1.5,
+            line_cap: LineCap::Round,
+            dash: tiny_skia::StrokeDash::new(vec![6.0, 5.0], phase.rem_euclid(11.0)),
+            ..Default::default()
+        };
+        let ts = self.transform();
+        self.pixmap.stroke_path(path, &paint, &stroke, ts, Some(self.clip));
+    }
+
+    /// Three dots along the bottom, centered on `cx` (shelf, player,
+    /// Control Center, left to right), the current page's bright.
+    fn page_dots(&mut self, cx: f32, page: f32, alpha: f32) {
+        for (i, x) in [cx - 9.0, cx, cx + 9.0].into_iter().enumerate() {
             // Brightness follows the slide, so the dots cross over with it.
-            // Top dot: Control Center, the page above.
-            let current = if i == 0 { page } else { 1.0 - page };
-            if let Some(dot) = PathBuilder::from_circle(x, y, 2.5) {
+            let current = match i {
+                0 => (-page).max(0.0),
+                1 => 1.0 - page.abs(),
+                _ => page.max(0.0),
+            };
+            if let Some(dot) = PathBuilder::from_circle(x, PAGE_DOTS_Y, 2.2) {
                 self.fill(&dot, WHITE, alpha * (0.3 + 0.6 * current));
             }
         }
@@ -1245,14 +1806,21 @@ impl Canvas<'_> {
         &mut self,
         media: Option<&NowPlaying>,
         transition: Option<&Transition>,
-        battery: Option<Battery>,
-        bluetooth: Option<DeviceKind>,
-        clock: f32,
+        (battery, bluetooth): (Option<Battery>, Option<DeviceKind>),
+        (clock, levels): (f32, Option<[f32; crate::meter::BARS]>),
+        time: &str,
         left: f32,
         right: f32,
         alpha: f32,
     ) {
         let mid = COLLAPSED.height / 2.0;
+        // The time leads on the left, as on the iPhone; what is playing
+        // follows it.
+        let mut media_left = left + CLOCK_X;
+        if let Some(fonts) = self.fonts.filter(|_| !time.is_empty()) {
+            self.text(&fonts.semibold, time, CLOCK_SIZE, left + CLOCK_X, mid + CLOCK_SIZE * 0.36, f32::MAX, WHITE, alpha);
+            media_left += text_width(&fonts.semibold, time, CLOCK_SIZE * self.scale) / self.scale + CLOCK_GAP;
+        }
         if let Some(kind) = bluetooth {
             let rightmost_left = match battery {
                 Some(b) => right - 14.0 - Self::battery_glyph_width(13.0, b.plugged),
@@ -1264,21 +1832,24 @@ impl Canvas<'_> {
         }
         for (slot, phase) in slots(media, transition, art_changed) {
             if let Some(art) = slot.and_then(|np| np.art.as_ref()) {
-                self.art(&art.pixmap, left + 12.0, mid - 10.0, 20.0, 5.0, alpha * phase.alpha, phase.zoom);
+                self.art(&art.pixmap, media_left, mid - 10.0, 20.0, 5.0, alpha * phase.alpha, phase.zoom);
             }
         }
         for (slot, phase) in slots(media, transition, presence_changed) {
             let Some(np) = slot else { continue };
             let color = if np.playing { GREEN } else { GRAY };
             let x0 = match battery {
-                Some(_) if np.art.is_some() => left + 40.0,
-                Some(_) => left + 12.0,
+                Some(_) if np.art.is_some() => media_left + 28.0,
+                Some(_) => media_left,
                 None => right - 27.0,
             };
             for (i, rest) in [8.0, 14.0, 10.0].into_iter().enumerate() {
-                // While playing, each bar mixes two waves at its own rates so
-                // the bounce never visibly repeats; paused, they hold still.
-                let h = if np.playing {
+                // While playing, the bars follow the output's level; without
+                // it, each mixes two waves at its own rates so the bounce
+                // never visibly repeats. Paused, they hold still.
+                let h = if let Some(levels) = levels.filter(|_| np.playing) {
+                    3.0 + 13.0 * levels[i]
+                } else if np.playing {
                     let f = i as f32;
                     let wave = (clock * (7.0 + f * 1.9) + f * 2.1).sin() * 0.6
                         + (clock * (11.3 - f * 2.3) + f * 0.7).sin() * 0.4;
@@ -1299,21 +1870,30 @@ impl Canvas<'_> {
         self.battery_glyph(x, mid - h / 2.0, h, b, alpha);
     }
 
-    fn alert(&mut self, alert: &Alert, left: f32, right: f32, alpha: f32) {
+    fn alert(&mut self, alert: &Alert, levels: Option<[f32; crate::meter::BARS]>, left: f32, right: f32, alpha: f32) {
         match alert {
             Alert::Battery { event, battery } => self.battery_alert(*event, *battery, left, right, alpha),
             Alert::Volume { level, muted } => self.volume_alert(*level, *muted, left, right, alpha),
             Alert::Toast(toast) => self.toast_alert(toast, left, right, alpha),
             Alert::Bluetooth { device, connected } => self.bluetooth_alert(device, *connected, left, right, alpha),
             Alert::NowPlaying { track, since } => {
-                self.now_playing_alert(track, since.elapsed().as_secs_f32(), left, right, alpha)
+                self.now_playing_alert(track, since.elapsed().as_secs_f32(), levels, left, right, alpha)
             }
         }
     }
 
     /// Cover on the left, title and artist beside it, and an equalizer
     /// dancing in the cover's color on the right. `t` is seconds shown.
-    fn now_playing_alert(&mut self, np: &NowPlaying, t: f32, left: f32, right: f32, alpha: f32) {
+    #[allow(clippy::too_many_arguments)]
+    fn now_playing_alert(
+        &mut self,
+        np: &NowPlaying,
+        t: f32,
+        levels: Option<[f32; crate::meter::BARS]>,
+        left: f32,
+        right: f32,
+        alpha: f32,
+    ) {
         // A little below center: the top edge meets the bezel.
         let mid = NOW_PLAYING_ALERT.height / 2.0 + 2.0;
         let art = 40.0;
@@ -1332,8 +1912,13 @@ impl Canvas<'_> {
         let eq_x = right - 22.0 - eq_w;
         let color = np.art.as_ref().map_or(GREEN, |a| vivid(a.tint));
         for i in 0..bars {
-            // Each bar bounces at its own rate; a paused track rests low.
-            let swing = if np.playing { 0.5 + 0.5 * (t * (5.0 + i as f32 * 1.7) + i as f32 * 1.3).sin() } else { 0.0 };
+            // Each bar follows the output's level, or without it bounces
+            // at its own rate; a paused track rests low.
+            let swing = match levels {
+                _ if !np.playing => 0.0,
+                Some(levels) => levels[i],
+                None => 0.5 + 0.5 * (t * (5.0 + i as f32 * 1.7) + i as f32 * 1.3).sin(),
+            };
             let h = 5.0 + 17.0 * swing;
             let x = eq_x + i as f32 * (bar_w + gap);
             if let Some(bar) = rounded_rect(x, mid - h / 2.0, bar_w, h, bar_w / 2.0) {
@@ -1348,18 +1933,31 @@ impl Canvas<'_> {
         self.text(&fonts.regular, &np.artist, 12.5, x, mid + 14.0, max, GRAY, alpha);
     }
 
-    /// Device icon and name on the left, "Connected"/"Disconnected" on the right.
+    /// Device icon and name on the left; on the right "Disconnected", or on
+    /// connecting the device's battery if Windows reports it (as iOS shows
+    /// AirPods), else "Connected".
     fn bluetooth_alert(&mut self, device: &Device, connected: bool, left: f32, right: f32, alpha: f32) {
         let Some(fonts) = self.fonts else { return };
         let mid = BLUETOOTH_ALERT.height / 2.0;
         self.device_icon(device.kind, left + 27.0, mid, alpha);
 
-        let (status, color) = if connected { ("Connected", GREEN) } else { ("Disconnected", GRAY) };
         let status_right = right - 20.0;
-        self.text_right(&fonts.semibold, status, 13.0, status_right, mid + 4.5, color, alpha);
+        let status_w = match device.battery.filter(|_| connected) {
+            Some(percent) => {
+                let h = 14.0;
+                let w = Self::battery_glyph_width(h, false);
+                let battery = Battery { percent, plugged: false, charging: false };
+                self.battery_glyph(status_right - w, mid - h / 2.0, h, battery, alpha);
+                w
+            }
+            None => {
+                let (status, color) = if connected { ("Connected", GREEN) } else { ("Disconnected", GRAY) };
+                self.text_right(&fonts.semibold, status, 13.0, status_right, mid + 4.5, color, alpha);
+                text_width(&fonts.semibold, status, 13.0 * self.scale) / self.scale
+            }
+        };
 
         let x = left + 44.0;
-        let status_w = text_width(&fonts.semibold, status, 13.0 * self.scale) / self.scale;
         let max = status_right - status_w - 12.0 - x;
         self.text(&fonts.semibold, &device.name, 13.5, x, mid + 4.5, max, WHITE, alpha);
     }
@@ -1719,7 +2317,7 @@ impl Canvas<'_> {
         }
         let mut clip = self.clip.clone();
         clip.intersect_path(&sheet, FillRule::Winding, true, self.transform());
-        let mut inner = Canvas { pixmap: &mut *self.pixmap, clip: &clip, scale: self.scale, fonts: self.fonts, dy: self.dy };
+        let mut inner = Canvas { pixmap: &mut *self.pixmap, clip: &clip, scale: self.scale, fonts: self.fonts, dx: self.dx, dy: self.dy };
         // Rows settle a few px up into place as they appear.
         inner.dy += (1.0 - ease_out_cubic(rows)) * 8.0;
         inner.output_rows(view, layout, alpha * rows);
@@ -1846,11 +2444,11 @@ impl Canvas<'_> {
                 }
                 Some(np) => {
                     let x = left + TEXT_X;
-                    let max = layout.player - TEXT_X - TEXT_RIGHT_PAD - layout.dots_clearance();
+                    let max = layout.player - TEXT_X - TEXT_RIGHT_PAD;
                     let title = TITLE_BASELINE + phase.dy;
                     let subtitle = SUBTITLE_BASELINE + phase.dy;
-                    self.text(&fonts.extrabold, &np.title, TITLE_SIZE, x, title, max, WHITE, a);
-                    self.text(&fonts.bold, &np.subtitle(), SUBTITLE_SIZE, x, subtitle, max, GRAY, a);
+                    self.text_heavy(&fonts.extrabold, &np.title, TITLE_SIZE, x, title, max, WHITE, a);
+                    self.text(&fonts.extrabold, &np.subtitle(), SUBTITLE_SIZE, x, subtitle, max, GRAY, a);
                 }
             }
         }
@@ -1903,7 +2501,7 @@ impl Canvas<'_> {
                     self.text(&fonts.regular, &line.text, 12.5, x, baseline, max_width, GRAY, alpha);
                 }
             }
-            LyricsView::Synced { lines, scroll } => {
+            LyricsView::Synced { lines, scroll, sung } => {
                 for (i, line) in lines.iter().enumerate() {
                     let d = i as f32 - scroll;
                     if !(-3.0..=4.0).contains(&d) {
@@ -1919,7 +2517,19 @@ impl Canvas<'_> {
                     let a = alpha * edge * (1.0 - d.abs() * 0.25).max(0.35);
                     // Empty LRC lines mark instrumental breaks.
                     let text = if line.text.is_empty() { "• • •" } else { &line.text };
-                    self.text(&fonts.semibold, text, 13.5, x, baseline, max_width, rgb, a);
+                    match sung.filter(|&(at, _)| at == i && !line.text.is_empty()) {
+                        // The line being sung lights up as it is sung, like
+                        // Apple Music: the part still to come stays
+                        // translucent.
+                        Some((_, chars)) => {
+                            let ahead = lerp_rgb(DIM, WHITE, focus * LYRIC_AHEAD);
+                            self.glyphs(&fonts.extrabold, text, LYRIC_SIZE, x, baseline, max_width, |i| {
+                                let t = ((chars - i as f32) / LYRIC_WIPE).clamp(0.0, 1.0);
+                                (lerp_rgb(ahead, rgb, t), a, LYRIC_LIFT * t)
+                            });
+                        }
+                        None => self.text(&fonts.extrabold, text, LYRIC_SIZE, x, baseline, max_width, rgb, a),
+                    }
                 }
             }
         }
@@ -1953,7 +2563,7 @@ impl Canvas<'_> {
         let times = alpha * (0.6 + 0.4 * grow.clamp(0.0, 1.0));
         let baseline = PROGRESS_Y + 4.0;
         self.text(&fonts.semibold, &elapsed, 12.0, left + TIME_LEFT, baseline, PANEL_W, WHITE, times);
-        let time_right = right - TIME_RIGHT_INSET - layout.dots_clearance();
+        let time_right = right - TIME_RIGHT_INSET;
         self.text_right(&fonts.semibold, &remaining, 12.0, time_right, baseline, WHITE, times);
 
         let (x0, x1) = layout.progress_span();
@@ -2080,17 +2690,60 @@ impl Canvas<'_> {
         rgb: Rgb,
         alpha: f32,
     ) {
+        self.glyphs(font, text, size, x, baseline, max_width, |_| (rgb, alpha, 0.0));
+    }
+
+    /// Like `text`, heavier than the font: each glyph is laid down twice,
+    /// a physical pixel apart, thickening its stems by that much. Inter's
+    /// heaviest weight here is ExtraBold; this gets close to Black without
+    /// another font file.
+    #[allow(clippy::too_many_arguments)]
+    fn text_heavy(
+        &mut self,
+        font: &Font,
+        text: &str,
+        size: f32,
+        x: f32,
+        baseline: f32,
+        max_width: f32,
+        rgb: Rgb,
+        alpha: f32,
+    ) {
+        // Overlapping, the two passes would be more opaque than one at the
+        // glyph's edges; a little less alpha each keeps them even.
+        let each = 1.0 - (1.0 - alpha.clamp(0.0, 1.0)).sqrt();
+        let nudge = 1.0 / self.scale;
+        // The second pass is one physical pixel right; the line keeps its
+        // width by starting half of that left.
+        self.glyphs(font, text, size, x - nudge / 2.0, baseline, max_width, |_| (rgb, each, 0.0));
+        self.glyphs(font, text, size, x + nudge / 2.0, baseline, max_width, |_| (rgb, each, 0.0));
+    }
+
+    /// Lays out `text` like `text`, styling each character by its index:
+    /// color, alpha, and how far (logical px) it is lifted.
+    #[allow(clippy::too_many_arguments)]
+    fn glyphs(
+        &mut self,
+        font: &Font,
+        text: &str,
+        size: f32,
+        x: f32,
+        baseline: f32,
+        max_width: f32,
+        mut style: impl FnMut(usize) -> (Rgb, f32, f32),
+    ) {
         let px = size * self.scale;
         let text = ellipsize(font, text, px, max_width * self.scale);
-        let baseline = ((baseline + self.dy) * self.scale).round();
-        let mut pen = x * self.scale;
-        for ch in text.chars() {
+        let baseline = (baseline + self.dy) * self.scale;
+        let mut pen = (x + self.dx) * self.scale;
+        for (i, ch) in text.chars().enumerate() {
             let glyph = match self.fonts {
                 Some(fonts) => fonts.glyph(font, ch, px),
                 None => Rc::new(font.rasterize(ch, px)),
             };
+            let (rgb, alpha, lift) = style(i);
             let gx = pen.round() as i32 + glyph.left;
-            let gy = baseline as i32 + glyph.top;
+            let gy = (baseline - lift * self.scale).round() as i32 + glyph.top;
             self.blend_coverage(gx, gy, glyph.width, glyph.height, &glyph.coverage, rgb, alpha);
             pen += glyph.advance;
         }
@@ -2227,7 +2880,7 @@ mod tests {
                 lyrics_reveal: 1.0,
                 media: Some(&np),
                 transition: None,
-                lyrics: LyricsView::Synced { lines: &lines, scroll: 1.0 },
+                lyrics: LyricsView::Synced { lines: &lines, scroll: 1.0, sung: Some((1, 9.5)) },
                 seek: None,
                 seek_grow: 0.0,
                 battery: Some(charging),
@@ -2236,7 +2889,10 @@ mod tests {
                 alert: None,
                 alert_from: None,
                 clock: 0.0,
+                levels: None,
+                time: "9:41",
                 outputs: OutputsView::default(),
+                shelf: ShelfView::default(),
                 page: 0.0,
                 controls: ControlsView::default(),
             },
@@ -2264,7 +2920,10 @@ mod tests {
                 alert: None,
                 alert_from: None,
                 clock: 0.0,
+                levels: None,
+                time: "9:41",
                 outputs: OutputsView::default(),
+                shelf: ShelfView::default(),
                 page: 0.0,
                 controls: ControlsView::default(),
             },
@@ -2272,7 +2931,7 @@ mod tests {
         );
 
         // Control Center: full width, player-only width, and mid-slide.
-        let buds = Device { name: "Galaxy Buds2 Pro".into(), kind: DeviceKind::Headphones };
+        let buds = Device { name: "Galaxy Buds2 Pro".into(), kind: DeviceKind::Headphones, battery: Some(72) };
         let state = ControlState { wifi: Some(true), bluetooth: Some(true), brightness: Some(70) };
         let controls = ControlsView {
             state,
@@ -2301,7 +2960,10 @@ mod tests {
             alert: None,
             alert_from: None,
             clock: 0.0,
+            levels: None,
+            time: "9:41",
             outputs: OutputsView::default(),
+            shelf: ShelfView::default(),
             page,
             controls,
         };
@@ -2319,6 +2981,13 @@ mod tests {
             outputs: OutputsView { list: &outputs, reveal, highlight: 0.0, ..Default::default() },
             ..page(EXPANDED.width, 0.0)
         };
+        // The notch as wide as the page it is on.
+        fn opened(scene: Scene<'_>) -> Scene<'_> {
+            Scene {
+                shape: Shape { width: open_width(scene.panel_width, scene.page, scene.shelf.items.len()), ..EXPANDED },
+                ..scene
+            }
+        }
         save_preview(&picker(1.0), "preview_outputs.png");
         save_preview(&picker(0.15), "preview_outputs_opening_a.png");
         save_preview(&picker(0.45), "preview_outputs_opening_b.png");
@@ -2329,9 +2998,43 @@ mod tests {
             ..page(EXPANDED.width, 0.0)
         };
         save_preview(&sliding, "preview_outputs_picking.png");
-        save_preview(&page(EXPANDED.width, 1.0), "preview_controls.png");
-        save_preview(&page(PLAYER_ONLY_WIDTH, 1.0), "preview_controls_narrow.png");
-        save_preview(&page(EXPANDED.width, 0.5), "preview_controls_sliding.png");
+        save_preview(&opened(page(EXPANDED.width, 1.0)), "preview_controls.png");
+        save_preview(&opened(page(PLAYER_ONLY_WIDTH, 0.5)), "preview_controls_narrow_sliding.png");
+        save_preview(&opened(page(EXPANDED.width, 0.5)), "preview_controls_sliding.png");
+
+        // The shelf: files (one with a picture thumbnail, one hovered), then
+        // empty, then with files coming in, then sliding up to the player.
+        let mut picture = Pixmap::new(88, 66).unwrap();
+        picture.fill(Color::from_rgba8(70, 130, 180, 255));
+        let file = |name: &str, icon: Option<Arc<Pixmap>>| shelf::Item {
+            path: std::path::PathBuf::from(format!("C:/{name}")),
+            name: name.into(),
+            icon,
+        };
+        let items = [
+            file("Holiday photo.jpg", Some(Arc::new(picture))),
+            file("Quarterly report final v2.docx", None),
+            file("notes.txt", None),
+        ];
+        let full = ShelfView { items: &items, hover: Some(ShelfHit::Remove(1)), ..Default::default() };
+        save_preview(&opened(Scene { shelf: full, ..page(EXPANDED.width, -1.0) }), "preview_shelf.png");
+        save_preview(&opened(page(EXPANDED.width, -1.0)), "preview_shelf_empty.png");
+        let incoming = ShelfView { items: &items, drop_glow: 1.0, ..Default::default() };
+        save_preview(&opened(Scene { shelf: incoming, clock: 0.3, ..page(EXPANDED.width, -1.0) }), "preview_shelf_drop.png");
+        // Lighting up halfway, and an empty shelf lit up.
+        let lighting = ShelfView { items: &items, drop_glow: 0.5, ..Default::default() };
+        save_preview(&opened(Scene { shelf: lighting, ..page(EXPANDED.width, -1.0) }), "preview_shelf_drop_lighting.png");
+        let empty_lit = ShelfView { drop_glow: 1.0, ..Default::default() };
+        save_preview(&opened(Scene { shelf: empty_lit, ..page(EXPANDED.width, -1.0) }), "preview_shelf_drop_empty.png");
+        // Two files dropped on one already there: they fall in, it slides over.
+        for (name, t) in [("a", 0.08), ("b", 0.2), ("c", 0.36), ("d", 0.5), ("e", 0.7)] {
+            let arrival = Arrival { count: 2, t, from: (330.0, 20.0) };
+            let arriving = ShelfView { items: &items, arrival: Some(arrival), ..Default::default() };
+            let file = format!("preview_shelf_arrival_{name}.png");
+            save_preview(&opened(Scene { shelf: arriving, ..page(EXPANDED.width, -1.0) }), &file);
+        }
+        let sliding = Scene { shelf: ShelfView { items: &items, ..Default::default() }, ..page(EXPANDED.width, -0.5) };
+        save_preview(&opened(sliding), "preview_shelf_sliding.png");
 
         // The resting notch with the battery indicator, then the alerts.
         let small = |shape: Shape, battery: Battery, alert: Option<Alert>| Scene {
@@ -2349,7 +3052,10 @@ mod tests {
             alert,
             alert_from: None,
             clock: 0.0,
+            levels: None,
+            time: "9:41",
             outputs: OutputsView::default(),
+            shelf: ShelfView::default(),
             page: 0.0,
             controls: ControlsView::default(),
         };
@@ -2367,9 +3073,16 @@ mod tests {
         let narrow = Shape { width: COLLAPSED.width + NotchWidth::Narrow.extra(), ..COLLAPSED };
         let scene = Scene { rest_width: narrow.width, battery: None, ..small(narrow, charging, None) };
         save_preview(&scene, "preview_collapsed_narrow_no_battery.png");
-        let buds = Device { name: "Galaxy Buds2 Pro".into(), kind: DeviceKind::Headphones };
+        let buds = Device { name: "Galaxy Buds2 Pro".into(), kind: DeviceKind::Headphones, battery: Some(72) };
         let connected = Alert::Bluetooth { device: buds, connected: true };
         save_preview(&small(BLUETOOTH_ALERT, on_battery, Some(connected)), "preview_bluetooth.png");
+        // A low keyboard, and a device that reports no battery.
+        let keyboard = Device { name: "AULA-S75Pro-1".into(), kind: DeviceKind::Keyboard, battery: Some(15) };
+        let low = Alert::Bluetooth { device: keyboard, connected: true };
+        save_preview(&small(BLUETOOTH_ALERT, on_battery, Some(low)), "preview_bluetooth_low.png");
+        let phone = Device { name: "Pixel 8".into(), kind: DeviceKind::Phone, battery: None };
+        let plain = Alert::Bluetooth { device: phone, connected: true };
+        save_preview(&small(BLUETOOTH_ALERT, on_battery, Some(plain)), "preview_bluetooth_no_battery.png");
         let plugged_in = Alert::Battery { event: BatteryEvent::PluggedIn, battery: charging };
         save_preview(&small(BATTERY_ALERT, charging, Some(plugged_in.clone())), "preview_alert.png");
         // "On battery" being replaced by "Charging": early, middle, late.
@@ -2426,6 +3139,31 @@ mod tests {
         let started = Instant::now() - Duration::from_millis(400);
         let now_playing = Alert::NowPlaying { track: Box::new(np.clone()), since: started };
         save_preview(&small(NOW_PLAYING_ALERT, on_battery, Some(now_playing)), "preview_now_playing.png");
+        // With the bars following the music rather than animating.
+        let levels = Some([0.35, 0.9, 0.6, 0.75]);
+        let now_playing = Alert::NowPlaying { track: Box::new(np.clone()), since: started };
+        let scene = Scene { levels, ..small(NOW_PLAYING_ALERT, on_battery, Some(now_playing)) };
+        save_preview(&scene, "preview_now_playing_levels.png");
+        save_preview(&Scene { levels, ..small(rest, on_battery, None) }, "preview_collapsed_levels.png");
+        // NOTCH_LIVE_METER=1: a few frames from what this machine is playing
+        // right now, through the real meter.
+        if std::env::var_os("NOTCH_LIVE_METER").is_some() {
+            use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap() };
+            let mut meter = crate::meter::Meter::new();
+            let mut bars = crate::meter::Bars::default();
+            for frame in 0..120 {
+                let levels = bars.update(meter.read(), 1.0 / 30.0);
+                if frame >= 60 && frame % 15 == 0 {
+                    println!("frame {frame}: {levels:?}");
+                    let now_playing = Alert::NowPlaying { track: Box::new(np.clone()), since: started };
+                    let scene = Scene { levels, ..small(NOW_PLAYING_ALERT, on_battery, Some(now_playing)) };
+                    save_preview(&scene, &format!("preview_live_alert_{frame}.png"));
+                    save_preview(&Scene { levels, ..small(rest, on_battery, None) }, &format!("preview_live_rest_{frame}.png"));
+                }
+                std::thread::sleep(Duration::from_millis(33));
+            }
+        }
 
         // A window under the notch: the mini pill, content faded out.
         save_preview(&small(MINI, on_battery, None), "preview_mini.png");
@@ -2437,7 +3175,7 @@ mod tests {
         let mut clip = Mask::new(strip.width(), strip.height()).unwrap();
         clip.data_mut().fill(255);
         let fonts = Fonts::load();
-        let mut canvas = Canvas { pixmap: &mut strip, clip: &clip, scale, fonts: fonts.as_ref(), dy: 0.0 };
+        let mut canvas = Canvas { pixmap: &mut strip, clip: &clip, scale, fonts: fonts.as_ref(), dx: 0.0, dy: 0.0 };
         let kinds = [DeviceKind::Headphones, DeviceKind::Keyboard, DeviceKind::Mouse, DeviceKind::Phone, DeviceKind::Other];
         for (i, kind) in kinds.into_iter().enumerate() {
             canvas.device_icon(kind, 14.0 + i as f32 * 23.0, 15.0, 1.0);

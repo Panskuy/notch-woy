@@ -28,18 +28,6 @@ impl AlertKind {
     }
 }
 
-impl AlertKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Battery => "Battery",
-            Self::Volume => "Volume (replaces the Windows pop-up)",
-            Self::Bluetooth => "Bluetooth devices",
-            Self::Notifications => "App notifications",
-            Self::NowPlaying => "New track",
-        }
-    }
-}
-
 /// How long alerts stay up, relative to each kind's own length. The
 /// discriminants are what is stored.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -178,6 +166,19 @@ impl Settings {
         }
     }
 
+    /// Packs the settings into one number, to post in a window message.
+    pub fn to_bits(self) -> usize {
+        self.alerts as usize
+            | (self.duration as usize) << 8
+            | (self.width as usize) << 12
+            | (self.bluetooth_quiet_minutes as usize) << 16
+    }
+
+    pub fn from_bits(bits: usize) -> Self {
+        let field = |shift: u32, mask: usize| Some(((bits >> shift) & mask) as u32);
+        Self::from_values(field(0, 0xFF), field(8, 0xF), field(12, 0xF), field(16, 0xFFFF))
+    }
+
     pub fn save(&self) {
         write(w!("Alerts"), self.alerts);
         write(w!("AlertDuration"), self.duration as u32);
@@ -255,6 +256,18 @@ mod tests {
         assert_eq!(set.duration, AlertDuration::Long);
         assert_eq!(set.width, NotchWidth::Wide);
         assert_eq!(set.bluetooth_quiet(), Duration::ZERO);
+    }
+
+    #[test]
+    fn round_trips_through_bits() {
+        let mut settings = Settings::default();
+        assert_eq!(Settings::from_bits(settings.to_bits()), settings);
+        settings.set_alert(AlertKind::Battery, false);
+        settings.set_alert(AlertKind::NowPlaying, false);
+        settings.duration = AlertDuration::Short;
+        settings.width = NotchWidth::Narrow;
+        settings.bluetooth_quiet_minutes = 60;
+        assert_eq!(Settings::from_bits(settings.to_bits()), settings);
     }
 
     #[test]

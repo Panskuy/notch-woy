@@ -138,6 +138,7 @@ dependencies = [
  "ab_glyph",
  "tiny-skia",
  "windows",
+ "windows-collections",
  "windows-core",
  "winresource",
 ]

@@ -11,6 +11,7 @@ mod font;
 mod icon;
 mod lyrics;
 mod media;
+mod meter;
 #[cfg(test)]
 mod memory;
 mod notifications;
@@ -18,6 +19,9 @@ mod outputs;
 mod palette;
 mod render;
 mod settings;
+mod shelf;
+mod settings_ui;
+mod settings_window;
 mod tray;
 mod volume;
 mod volume_keys;

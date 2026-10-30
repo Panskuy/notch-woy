@@ -1,14 +1,19 @@
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use tiny_skia::Pixmap;
-use windows::core::{w, Error, Result};
+use windows::core::{w, Error, Result, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DwmFlush, DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Globalization::{GetTimeFormatEx, TIME_NOSECONDS, TIME_NOTIMEMARKER};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
+use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
@@ -23,12 +28,16 @@ use crate::volume::{Volume, WM_VOLUME};
 use crate::volume_keys::{self, VolumeKey, WM_VOLUME_KEY};
 use crate::lyrics::{Fetcher, LyricsState, Query, WM_LYRICS};
 use crate::media::{self, Command, Media, NowPlaying, WM_MEDIA};
+use crate::meter::{Bars, Meter};
 use crate::notifications::{Notifications, WM_TOAST};
 use crate::outputs::{Output, Outputs, WM_OUTPUTS};
 use crate::settings::{AlertKind, Settings};
+use crate::shelf::{self, Shelf, WM_SHELF};
+use crate::settings_window::{self, WM_SETTINGS_CHANGED};
 use crate::tray::{self, WM_TRAY};
 use crate::render::{
-    self, Alert, Button, ControlHit, ControlsView, Fonts, LyricsView, OutputsView, Scene, Shape, Slider, Toggle,
+    self, Alert, Arrival, Button, ControlHit, ControlsView, Fonts, LyricsView, OutputsView, Scene, Shape, ShelfHit, ShelfView,
+    Slider, Toggle,
     OUTPUT_ROWS_SHOWN,
     Transition, COLLAPSED, COLLAPSED_BATTERY_WIDTH, EXPANDED, MINI, PLAYER_ONLY_WIDTH, SHADOW_PAD,
 };
@@ -46,6 +55,9 @@ const TRACK_TRANSITION: Duration = Duration::from_millis(600);
 /// Ticks the progress bar and synced lyrics while the notch is open.
 const PROGRESS_TIMER: usize = 1;
 const PROGRESS_INTERVAL_MS: u32 = 100;
+/// The same tick while synced lyrics show and play: the sung line lights
+/// up character by character, which needs ~30 fps to look smooth.
+const LYRICS_INTERVAL_MS: u32 = 33;
 
 /// Fires once a touchpad scroll has been still this long: the fingers
 /// lifted, so the pages settle.
@@ -57,16 +69,50 @@ const SCROLL_END_MS: u32 = 120;
 /// run for hours.
 const EQUALIZER_TIMER: usize = 5;
 const EQUALIZER_INTERVAL_MS: u32 = 33;
+/// The time of day as Windows formats it for the user (12 or 24 hours),
+/// without seconds or AM/PM, as on the iPhone ("9:41").
+pub fn clock_text() -> String {
+    let mut buf = [0u16; 32];
+    let len = unsafe { GetTimeFormatEx(PCWSTR::null(), TIME_NOSECONDS | TIME_NOTIMEMARKER, None, PCWSTR::null(), Some(&mut buf)) };
+    // The length counts the terminating null.
+    String::from_utf16_lossy(&buf[..(len.max(1) - 1) as usize]).trim().to_owned()
+}
+
+/// Arms `CLOCK_TIMER` for just after the next minute starts.
+fn schedule_clock(hwnd: HWND) {
+    let now = unsafe { GetLocalTime() };
+    let into_minute = now.wSecond as u32 * 1000 + now.wMilliseconds as u32;
+    unsafe {
+        SetTimer(Some(hwnd), CLOCK_TIMER, 60_000 - into_minute.min(59_999) + 50, None);
+    }
+}
+
+/// Re-reads the time and redraws if the shown minute changed.
+fn update_clock() {
+    let result = with_app(|app| {
+        let time = clock_text();
+        if time == app.time {
+            return Ok(());
+        }
+        app.time = time;
+        app.invalidate()
+    });
+    if let Some(Err(e)) = result {
+        eprintln!("clock redraw failed: {e}");
+    }
+}
+
 /// Page travel (0..100) per unit of wheel delta: two mouse notches' worth
 /// of touchpad scrolling turns a page.
 const PAGE_PER_WHEEL_UNIT: f32 = 100.0 / 240.0;
 
-/// Past either page, travel is resisted and capped, like iOS rubber-banding.
+/// Past either end page (shelf at -100, Control Center at 100), travel is
+/// resisted and capped, like iOS rubber-banding.
 fn rubber_band(raw: f32) -> f32 {
     const LIMIT: f32 = 18.0;
     let stretch = |over: f32| LIMIT * (1.0 - 1.0 / (over * 0.55 / LIMIT + 1.0));
-    if raw < 0.0 {
-        -stretch(-raw)
+    if raw < -100.0 {
+        -100.0 - stretch(-100.0 - raw)
     } else if raw > 100.0 {
         100.0 + stretch(raw - 100.0)
     } else {
@@ -85,6 +131,25 @@ const RECHECK_MS: u32 = 250;
 /// login...).
 const HIDDEN_RECHECK_TIMER: usize = 6;
 const HIDDEN_RECHECK_MS: u32 = 1000;
+
+/// Fires at the turn of each minute, for the resting notch's clock.
+const CLOCK_TIMER: usize = 9;
+
+/// Once the notch has been at rest this long (and after start-up), the
+/// pages it is not using go back to Windows; see `trim_working_set`.
+const TRIM_TIMER: usize = 8;
+const TRIM_IDLE_MS: u32 = 30_000;
+/// While it stays at rest, trims again this often: the polling workers'
+/// WinRT calls spread allocations over fresh heap pages, so the touched set
+/// creeps up between trims.
+const TRIM_REPEAT_MS: u32 = 5 * 60_000;
+
+/// A file being dragged out of the shelf; the notch's own drop target
+/// ignores that drag.
+static DRAGGING_OUT: AtomicBool = AtomicBool::new(false);
+/// Pointer travel (logical px) that turns a press on a shelf file into
+/// dragging it out.
+const DRAG_THRESHOLD: f32 = 6.0;
 
 /// The notch window, for window events that arrive while the app state is
 /// busy and must be retried.
@@ -108,6 +173,8 @@ const TRACK_PULSE: (f32, f32) = (320.0, 90.0);
 /// The same, when one alert replaces another; softer, as the shape is
 /// already out.
 const ALERT_PULSE: (f32, f32) = (260.0, 60.0);
+/// The same, when files are dropped on the notch: it swallows them.
+const DROP_PULSE: (f32, f32) = (220.0, 70.0);
 /// Closes the output picker once a pick's highlight has slid over.
 const PICKER_CLOSE_TIMER: usize = 7;
 const PICKER_CLOSE_MS: u32 = 420;
@@ -159,6 +226,11 @@ struct App {
     /// When the app started; a track found playing right then gets no Now
     /// Playing card.
     started: Instant,
+    /// The resting notch's clock text; see `clock_text`.
+    time: String,
+    /// The open notch's tick (`PROGRESS_TIMER`) interval, ms; 0 when not
+    /// armed yet.
+    progress_interval: u32,
     /// Volume alert slider, in percent.
     volume: Spring,
     notifications: Notifications,
@@ -168,13 +240,14 @@ struct App {
     audio: Volume,
     controls: Controls,
     control_state: ControlState,
-    /// Open notch page, 0 (player) .. 100 (Control Center).
+    /// Open notch page, side by side: -100 (shelf, left), 0 (player),
+    /// 100 (Control Center, right).
     page: Spring,
     /// While a touchpad drags the pages: where the fingers have taken them
-    /// (0..100, unclamped), before rubber-banding.
+    /// (-100..100, unclamped), before rubber-banding.
     page_drag: Option<f32>,
-    /// The drag's latest direction.
-    page_drag_toward_controls: bool,
+    /// The drag's latest direction: to the right.
+    page_drag_rightward: bool,
     /// A Control Center slider being dragged, with its value (0..1).
     slider_drag: Option<(Slider, f32)>,
     /// Per toggle (`Toggle::index`), how switched on it looks, 0..100;
@@ -191,6 +264,11 @@ struct App {
     monitor: RECT,
     /// `EQUALIZER_TIMER` is running.
     equalizer_ticking: bool,
+    /// The output's peak meter and the equalizer bars made from it.
+    meter: Meter,
+    bars: Bars,
+    /// When the bars last moved; `None` while no equalizer shows.
+    bars_at: Option<Instant>,
     outputs: Outputs,
     /// The output devices, as last read.
     output_list: Vec<Output>,
@@ -215,6 +293,36 @@ struct App {
     shadow_shape: Option<(f32, f32, f32)>,
     /// The tray menu's choices.
     settings: Settings,
+    shelf: Shelf,
+    /// First shelf tile shown.
+    shelf_scroll: Spring,
+    shelf_hover: Option<ShelfHit>,
+    /// What the button went down on, and where (to tell a click from a drag).
+    shelf_pressed: Option<(ShelfHit, (f32, f32))>,
+    /// Files are being dragged over the notch: it is open as a drop zone.
+    drop_hover: bool,
+    /// How far the drop zone is lit up, 0..100; follows `drop_hover`.
+    drop_glow: Spring,
+    /// Files just dropped on the shelf: when, how many, and where (logical
+    /// canvas px) they were let go.
+    shelf_arrival: Option<(Instant, usize, (f32, f32))>,
+}
+
+/// Hands drags over the notch to the app.
+struct NotchDrop;
+
+impl shelf::DropSink for NotchDrop {
+    fn drag_hover(&self, files: bool) {
+        with_app(|app| app.on_drag_hover(files));
+    }
+
+    fn dropped(&self, paths: Vec<PathBuf>) {
+        with_app(|app| app.on_drop(paths));
+    }
+
+    fn dragging_out(&self) -> bool {
+        DRAGGING_OUT.load(Ordering::Relaxed)
+    }
 }
 
 thread_local! {
@@ -317,6 +425,8 @@ pub fn run() -> Result<()> {
             alert: None,
             alert_transition: None,
             started: Instant::now(),
+            time: clock_text(),
+            progress_interval: 0,
             volume: Spring::new(0.0),
             notifications: Notifications::spawn(hwnd),
             bluetooth: Bluetooth::spawn(hwnd, settings.bluetooth_quiet()),
@@ -326,7 +436,7 @@ pub fn run() -> Result<()> {
             control_state: ControlState::default(),
             page: Spring::smooth(0.0),
             page_drag: None,
-            page_drag_toward_controls: false,
+            page_drag_rightward: false,
             slider_drag: None,
             toggle_on: [Spring::smooth(0.0); 4],
             toggle_press: [Spring::new(100.0); 4],
@@ -334,6 +444,9 @@ pub fn run() -> Result<()> {
             fullscreen: false,
             monitor: RECT::default(),
             equalizer_ticking: false,
+            meter: Meter::new(),
+            bars: Bars::default(),
+            bars_at: None,
             outputs: Outputs::new(hwnd),
             output_list: Vec::new(),
             output_picker: false,
@@ -347,12 +460,22 @@ pub fn run() -> Result<()> {
             shadow: None,
             shadow_shape: None,
             settings,
+            shelf: Shelf::new(hwnd, 1.0),
+            shelf_scroll: Spring::smooth(0.0),
+            shelf_hover: None,
+            shelf_pressed: None,
+            drop_hover: false,
+            drop_glow: Spring::new(0.0),
+            shelf_arrival: None,
         };
         // Read ahead so the picker opens with the list already there.
         app.outputs.refresh();
         APP.with_borrow_mut(|slot| *slot = Some(app));
         NOTCH_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
         tray::add(hwnd);
+        if let Err(e) = shelf::register_drop_target(hwnd, Box::new(NotchDrop)) {
+            eprintln!("the shelf takes no drops: {e}");
+        }
         // Only while the notch shows volume alerts: otherwise the keys would
         // change the volume with nothing on screen.
         if settings.alert_enabled(AlertKind::Volume) {
@@ -364,9 +487,15 @@ pub fn run() -> Result<()> {
         // After showing: it hides the notch again if an app is full screen.
         with_app(App::update_obstruction);
 
+        // Start-up leaves a lot behind (WinRT and device set-up) that idle
+        // never touches again.
+        SetTimer(Some(hwnd), TRIM_TIMER, TRIM_IDLE_MS, None);
+        schedule_clock(hwnd);
+
         let mut msg = MSG::default();
         loop {
-            if with_app(|app| app.is_animating()).unwrap_or(false) {
+            let notch = with_app(|app| app.is_animating()).unwrap_or(false);
+            if notch || settings_window::is_animating() {
                 while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                     if msg.message == WM_QUIT {
                         return Ok(());
@@ -374,9 +503,10 @@ pub fn run() -> Result<()> {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
-                if let Some(Err(e)) = with_app(App::tick) {
+                if notch && let Some(Err(e)) = with_app(App::tick) {
                     eprintln!("frame failed: {e}");
                 }
+                settings_window::frame();
                 // Paces frames to the compositor's vsync.
                 let _ = DwmFlush();
             } else {
@@ -389,6 +519,17 @@ pub fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Hands the pages the app is not using back to Windows, so its memory in
+/// Task Manager is what idle really touches. Start-up (WinRT, device and
+/// audio set-up) leaves several MB behind that the notch never reads again;
+/// pages it does need come back as soft faults (no disk read), which costs
+/// microseconds the next time the notch moves.
+pub fn trim_working_set() {
+    unsafe {
+        let _ = EmptyWorkingSet(GetCurrentProcess());
+    }
 }
 
 /// Re-checks what is under the notch whenever the active window changes,
@@ -520,12 +661,41 @@ mod tests {
         assert_eq!(rubber_band(0.0), 0.0);
         assert_eq!(rubber_band(37.5), 37.5);
         assert_eq!(rubber_band(100.0), 100.0);
+        assert_eq!(rubber_band(-40.0), -40.0);
         // Past them it is resisted, and never goes beyond the limit.
-        let a = rubber_band(-10.0);
-        let b = rubber_band(-40.0);
-        assert!(a < 0.0 && b < a && b > -18.0, "{a} {b}");
+        let a = rubber_band(110.0);
+        let b = rubber_band(140.0);
+        assert!(a > 100.0 && b > a && b < 118.0, "{a} {b}");
         assert!(rubber_band(10_000.0) < 118.0);
         assert!(rubber_band(110.0) > 100.0 && rubber_band(110.0) < 110.0);
+        // Down to the shelf the same way.
+        assert_eq!(rubber_band(-100.0), -100.0);
+        let below = rubber_band(-140.0);
+        assert!(below < -100.0 && below > -118.0, "{below}");
+    }
+
+    #[test]
+    fn clock_is_hours_and_minutes() {
+        // Windows' own short time format, without seconds or AM/PM: "9:41",
+        // "09:41" or "21:41", whatever the user's settings.
+        let time = clock_text();
+        let (hours, minutes) = time.split_once(':').expect(&time);
+        assert!((1..=2).contains(&hours.len()) && hours.chars().all(|c| c.is_ascii_digit()), "{time}");
+        assert!(minutes.len() == 2 && minutes.chars().all(|c| c.is_ascii_digit()), "{time}");
+    }
+
+    #[test]
+    fn touchpad_settles_on_pages() {
+        // From the player: a fifth of the way is enough, either way.
+        assert_eq!(page_after_drag(25.0, true), 100.0);
+        assert_eq!(page_after_drag(15.0, true), 0.0);
+        assert_eq!(page_after_drag(-25.0, false), -100.0);
+        assert_eq!(page_after_drag(-15.0, false), 0.0);
+        // Back from the shelf, and past the ends.
+        assert_eq!(page_after_drag(-75.0, true), 0.0);
+        assert_eq!(page_after_drag(-90.0, true), -100.0);
+        assert_eq!(page_after_drag(115.0, true), 100.0);
+        assert_eq!(page_after_drag(-115.0, false), -100.0);
     }
 
     /// Prints whether the active window reaches under a 230x30 notch at the
@@ -591,6 +761,10 @@ impl App {
             || self.alert_transition.is_some()
             // Its equalizer moves for as long as it is on screen.
             || matches!(self.alert, Some((Alert::NowPlaying { .. }, _)))
+            // The drop zone's dashes march while files are over it, and
+            // dropped files fall into place.
+            || self.drop_hover
+            || self.shelf_arrival.is_some()
             || ![
                 self.width,
                 self.height,
@@ -606,6 +780,8 @@ impl App {
                 self.output_highlight,
                 self.output_hover,
                 self.output_hover_alpha,
+                self.shelf_scroll,
+                self.drop_glow,
             ]
             .iter()
             .chain(&self.toggle_on)
@@ -656,16 +832,21 @@ impl App {
     fn set_hovered(&mut self, hovered: bool) {
         // Dragging the progress knob or a slider past the notch's edge must
         // not close it.
-        let dragging = self.seeking.is_some() || self.slider_drag.is_some();
+        let dragging = self.seeking.is_some() || self.slider_drag.is_some() || self.shelf_pressed.is_some();
         if self.hovered == hovered || !hovered && dragging {
             return;
         }
         self.hovered = hovered;
         self.retarget();
         if !hovered {
-            // It opens on the player next time, as the island does.
-            self.page = Spring::smooth(0.0);
+            // It opens on the player next time, as the island does; unless
+            // files are being dragged onto it.
+            if !self.drop_hover {
+                self.page = Spring::smooth(0.0);
+            }
             self.page_drag = None;
+            self.shelf_hover = None;
+            self.shelf_pressed = None;
             self.output_picker = false;
             self.output_reveal = Spring::new(0.0);
             self.output_hover_alpha = Spring::smooth(0.0);
@@ -694,9 +875,8 @@ impl App {
             // instead of scrolling through everything sung meanwhile.
             self.update_lyric_line(true);
             self.rearm_mouse_leave();
-            unsafe {
-                SetTimer(Some(self.hwnd), PROGRESS_TIMER, PROGRESS_INTERVAL_MS, None);
-            }
+            self.progress_interval = 0;
+            self.arm_progress_timer();
         } else {
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), PROGRESS_TIMER);
@@ -832,8 +1012,8 @@ impl App {
         let rest = collapsed_shape(self.battery, self.settings);
         let target = if let Some(alert) = showing_alert.filter(|_| self.showing_toast()) {
             render::alert_shape(alert, rest.width)
-        } else if self.hovered {
-            Shape { width: self.panel_width.target, ..EXPANDED }
+        } else if self.hovered || self.drop_hover {
+            Shape { width: self.open_width(), ..EXPANDED }
         } else if let Some(alert) = showing_alert {
             render::alert_shape(alert, rest.width)
         } else if self.obstructed {
@@ -844,6 +1024,11 @@ impl App {
         self.width.target = target.width;
         self.height.target = target.height;
         self.radius.target = target.radius;
+    }
+
+    /// The open notch's width for the page it is on or heading to.
+    fn open_width(&self) -> f32 {
+        render::open_width(self.panel_width.target, self.page.target / 100.0, self.shelf.len())
     }
 
     /// Re-reads the battery; a change worth it (plugged in, low...) starts
@@ -959,6 +1144,13 @@ impl App {
         self.output_highlight.update(dt);
         self.output_hover.update(dt);
         self.output_hover_alpha.update(dt);
+        self.shelf_scroll.update(dt);
+        self.drop_glow.update(dt);
+        if let Some((at, count, _)) = self.shelf_arrival
+            && at.elapsed().as_secs_f32() >= render::shelf_arrival_length(count)
+        {
+            self.shelf_arrival = None;
+        }
         for spring in self.toggle_on.iter_mut().chain(&mut self.toggle_press) {
             spring.update(dt);
         }
@@ -973,10 +1165,35 @@ impl App {
         if self.alert.as_ref().is_some_and(|(_, leaving)| *leaving) && self.height.is_settled() {
             self.alert = None;
         }
+        if !self.hovered && !self.is_animating() {
+            // At rest: trim once it stays that way (re-setting restarts it).
+            unsafe {
+                SetTimer(Some(self.hwnd), TRIM_TIMER, TRIM_IDLE_MS, None);
+            }
+        }
         result
     }
 
+    /// The equalizer bars' heights (0..1) from what the output is playing,
+    /// while an equalizer shows (the resting notch's or a new track's);
+    /// `None` when none shows or the meter cannot see the music, and the
+    /// equalizers animate on their own.
+    fn equalizer_levels(&mut self) -> Option<[f32; crate::meter::BARS]> {
+        let playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
+        let new_track = matches!(self.alert, Some((Alert::NowPlaying { .. }, _)));
+        if !playing || !(self.equalizer_ticking || new_track) {
+            // The meter is only read while it is shown.
+            self.bars_at = None;
+            return None;
+        }
+        let now = Instant::now();
+        let dt = self.bars_at.map_or(0.0, |at| now.duration_since(at).as_secs_f32());
+        self.bars_at = Some(now);
+        self.bars.update(self.meter.read(), dt)
+    }
+
     fn redraw(&mut self) -> Result<()> {
+        let levels = self.equalizer_levels();
         let shape = Shape {
             width: self.width.value,
             height: self.height.value,
@@ -992,6 +1209,9 @@ impl App {
             LyricsState::Found(l) if l.synced => LyricsView::Synced {
                 lines: &l.lines,
                 scroll: self.lyric_scroll.value,
+                sung: self.lyric_line.zip(self.now_playing.as_ref().and_then(NowPlaying::progress)).map(
+                    |(line, (position, _))| (line, l.sung(line, position)),
+                ),
             },
             LyricsState::Found(l) => LyricsView::Plain(&l.lines),
         };
@@ -1036,6 +1256,8 @@ impl App {
             page: self.page.value / 100.0,
             controls,
             clock: self.started.elapsed().as_secs_f32(),
+            levels,
+            time: &self.time,
             outputs: OutputsView {
                 list: &self.output_list,
                 reveal: self.output_reveal.value / 100.0,
@@ -1044,6 +1266,14 @@ impl App {
                 hover: self.output_hover.value,
                 hover_alpha: self.output_hover_alpha.value / 100.0,
                 pressed: self.output_pressed,
+            },
+            shelf: ShelfView {
+                items: self.shelf.items(),
+                scroll: self.shelf_scroll.value,
+                hover: self.shelf_hover,
+                pressed: self.shelf_pressed.map(|(hit, _)| hit),
+                drop_glow: self.drop_glow.value / 100.0,
+                arrival: self.shelf_arrival.map(|(at, count, from)| Arrival { count, t: at.elapsed().as_secs_f32(), from }),
             },
         };
         render::draw(&mut self.pixmap, self.scale, &scene, self.fonts.as_ref());
@@ -1196,13 +1426,16 @@ impl App {
         self.hovered && self.page.target > 50.0
     }
 
-    /// Mouse wheel or touchpad scroll: up for Control Center (the page
-    /// above), down for the player. A mouse notch turns a whole page. A
-    /// touchpad drags the pages along with the fingers (rubber-banding past either end) and lets go
-    /// onto a page once the fingers stop.
+    fn scrollable(&self) -> bool {
+        self.hovered && self.height.value >= EXPANDED.height * 0.9 && !self.showing_toast()
+    }
+
+    /// Mouse wheel or touchpad scroll up (`delta` > 0) or down. Scrolls the
+    /// output picker or the shelf's files when they are showing (the shelf
+    /// hands a mouse wheel on to the pages once at its end); otherwise down
+    /// turns to the page on the right, as Windows' sideways lists do.
     fn on_wheel(&mut self, delta: i32) -> Result<()> {
-        let open = self.hovered && self.height.value >= EXPANDED.height * 0.9 && !self.showing_toast();
-        if !open || delta == 0 {
+        if !self.scrollable() || delta == 0 {
             return Ok(());
         }
         self.start_animation();
@@ -1213,20 +1446,50 @@ impl App {
             self.output_scroll.target = target.clamp(0.0, max);
             return Ok(());
         }
-        // Mouse wheels move in whole notches of 120; touchpads in small steps.
-        if delta.abs() >= 120 && self.page_drag.is_none() {
-            self.settle_page(if delta > 0 { 100.0 } else { 0.0 });
-            return Ok(());
+        if self.on_shelf_page() && self.page_drag.is_none() && self.shelf_max_scroll() > 0.0 {
+            let before = self.shelf_scroll.target;
+            self.scroll_shelf(-delta);
+            // A touchpad stops at the end, so a scroll through the files
+            // does not run on into the player.
+            if self.shelf_scroll.target != before || delta.abs() < 120 {
+                return Ok(());
+            }
         }
-        // Control Center is the page above: scrolling up brings it down.
+        self.turn_pages(-delta);
+        Ok(())
+    }
+
+    /// Sideways scroll (touchpads, tilt wheels), `delta` > 0 to the right:
+    /// the pages follow.
+    fn on_sideways_wheel(&mut self, delta: i32) {
+        // The output picker covers the player; it only scrolls up and down.
+        if !self.scrollable() || delta == 0 || (self.output_picker && !self.on_controls_page()) {
+            return;
+        }
+        self.start_animation();
+        self.turn_pages(delta);
+    }
+
+    /// Toward the page on the right (`delta` > 0, Control Center) or the
+    /// left (the shelf). A mouse notch turns a whole page. A touchpad drags
+    /// the pages along with the fingers (rubber-banding past either end)
+    /// and lets go onto a page once the fingers stop.
+    fn turn_pages(&mut self, delta: i32) {
+        // Mouse wheels move in whole notches of 120 (a page each); touchpads
+        // in small steps.
+        if delta.abs() >= 120 && self.page_drag.is_none() {
+            let step = if delta > 0 { 100.0 } else { -100.0 };
+            self.settle_page((self.page.target + step).clamp(-100.0, 100.0));
+            return;
+        }
         let raw = self.page_drag.unwrap_or(self.page.target) + delta as f32 * PAGE_PER_WHEEL_UNIT;
         self.page_drag = Some(raw);
-        self.page_drag_toward_controls = delta > 0;
+        self.page_drag_rightward = delta > 0;
         self.page.target = rubber_band(raw);
+        self.retarget();
         unsafe {
             SetTimer(Some(self.hwnd), SCROLL_END_TIMER, SCROLL_END_MS, None);
         }
-        Ok(())
     }
 
     /// The fingers stopped: go to the page they were heading for once past
@@ -1236,21 +1499,178 @@ impl App {
             let _ = KillTimer(Some(self.hwnd), SCROLL_END_TIMER);
         }
         let Some(raw) = self.page_drag.take() else { return };
-        let target = match self.page_drag_toward_controls {
-            true if raw > 20.0 => 100.0,
-            false if raw < 80.0 => 0.0,
-            _ if raw > 50.0 => 100.0,
-            _ => 0.0,
-        };
         self.start_animation();
-        self.settle_page(target);
+        self.settle_page(page_after_drag(raw, self.page_drag_rightward));
     }
 
     fn settle_page(&mut self, target: f32) {
         self.page.target = target;
+        self.retarget();
         if target > 50.0 {
             // Radios may have been switched elsewhere since last looked.
             self.controls.send(ControlCommand::Refresh);
+        }
+    }
+
+    fn on_shelf_page(&self) -> bool {
+        (self.hovered || self.drop_hover) && self.page.target < -50.0
+    }
+
+    fn shelf_hit(&self, x: f32, y: f32) -> Option<ShelfHit> {
+        let (count, scroll) = (self.shelf.len(), self.shelf_scroll.value);
+        render::shelf_at(self.pixmap.width(), self.scale, count, scroll, (x, y))
+    }
+
+    /// Files dragged over the notch (`true`) or away (`false`): it opens
+    /// onto the shelf as a drop zone, and closes again unless the pointer
+    /// rests on it.
+    fn on_drag_hover(&mut self, files: bool) {
+        if self.drop_hover == files {
+            return;
+        }
+        self.start_animation();
+        self.drop_hover = files;
+        self.drop_glow.target = if files { 100.0 } else { 0.0 };
+        if files {
+            self.close_output_picker();
+            self.page_drag = None;
+            if self.hovered {
+                self.page.target = -100.0;
+            } else {
+                // Straight onto the shelf as it grows, not via the player.
+                self.page = Spring::smooth(-100.0);
+            }
+        } else if !self.hovered {
+            self.page = Spring::smooth(0.0);
+        }
+        self.retarget();
+        let _ = self.invalidate();
+    }
+
+    fn on_drop(&mut self, paths: Vec<PathBuf>) {
+        self.start_animation();
+        self.drop_hover = false;
+        self.drop_glow.target = 0.0;
+        let added = self.shelf.add(paths);
+        if added > 0 {
+            // The newest are first; bring them into view, falling in.
+            self.shelf_scroll.target = 0.0;
+            self.shelf_arrival = Some((Instant::now(), added, self.pointer()));
+            // The notch swallows them.
+            self.width.kick(DROP_PULSE.0);
+            self.height.kick(DROP_PULSE.1);
+        }
+        // The pointer is on the notch: it stays open on the shelf.
+        self.set_hovered(true);
+        self.page.target = -100.0;
+        self.retarget();
+        let _ = self.invalidate();
+    }
+
+    /// The pointer in logical canvas px.
+    fn pointer(&self) -> (f32, f32) {
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+        }
+        ((pt.x - self.origin.x) as f32 / self.scale, (pt.y - self.origin.y) as f32 / self.scale)
+    }
+
+    fn on_shelf_down(&mut self, x: f32, y: f32) -> Result<()> {
+        if let Some(hit) = self.shelf_hit(x, y) {
+            self.shelf_pressed = Some((hit, (x, y)));
+            // A file pressed may be dragged off the notch.
+            unsafe { SetCapture(self.hwnd) };
+        }
+        self.invalidate()
+    }
+
+    /// A pressed file moved far enough: its drag out of the shelf starts.
+    /// Returns its path; the drag itself runs with the state released.
+    fn shelf_drag_start(&mut self, x: f32, y: f32) -> Option<PathBuf> {
+        let (ShelfHit::Item(index), (x0, y0)) = self.shelf_pressed? else { return None };
+        if (x - x0).hypot(y - y0) < DRAG_THRESHOLD * self.scale {
+            return None;
+        }
+        self.shelf_pressed = None;
+        let _ = self.invalidate();
+        self.shelf.items().get(index).map(|item| item.path.clone())
+    }
+
+    /// The button came up after a press on the shelf: a click if it is
+    /// still on what it went down on.
+    fn finish_shelf_press(&mut self, x: f32, y: f32) -> Result<()> {
+        let Some((pressed, _)) = self.shelf_pressed.take() else { return Ok(()) };
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        if self.shelf_hit(x, y) == Some(pressed) {
+            match pressed {
+                ShelfHit::Item(index) => self.shelf.open(index),
+                ShelfHit::Remove(index) => {
+                    self.shelf.remove(index);
+                    self.shelf_hover = None;
+                    self.clamp_shelf_scroll();
+                    self.retarget();
+                }
+                ShelfHit::Share => {
+                    // The share sheet hangs below the notch's top center.
+                    let anchor = POINT {
+                        x: self.origin.x + self.pixmap.width() as i32 / 2,
+                        y: self.origin.y + (EXPANDED.height * self.scale) as i32,
+                    };
+                    if let Err(e) = self.shelf.share(anchor) {
+                        eprintln!("share failed: {e}");
+                    }
+                }
+                ShelfHit::Clear => {
+                    self.shelf.clear();
+                    self.shelf_hover = None;
+                    self.shelf_scroll = Spring::smooth(0.0);
+                    self.retarget();
+                }
+            }
+        }
+        self.rearm_mouse_leave();
+        self.invalidate()
+    }
+
+    /// After a drag out of the shelf: a moved file leaves it.
+    fn after_drag_out(&mut self) {
+        if self.shelf.prune() {
+            self.shelf_hover = None;
+            self.clamp_shelf_scroll();
+            self.retarget();
+        }
+        self.rearm_mouse_leave();
+        let _ = self.invalidate();
+    }
+
+    fn on_shelf_hover(&mut self, x: f32, y: f32) {
+        let hit = if self.on_shelf_page() { self.shelf_hit(x, y) } else { None };
+        if hit != self.shelf_hover {
+            self.shelf_hover = hit;
+            let _ = self.invalidate();
+        }
+    }
+
+    /// Through the files; `delta` in wheel units, positive to the right
+    /// (later files).
+    fn scroll_shelf(&mut self, delta: i32) {
+        self.start_animation();
+        let max = self.shelf_max_scroll();
+        self.shelf_scroll.target = (self.shelf_scroll.target + delta as f32 / 120.0).clamp(0.0, max);
+    }
+
+    fn shelf_max_scroll(&self) -> f32 {
+        render::shelf_max_scroll(self.pixmap.width(), self.scale, self.shelf.len())
+    }
+
+    fn clamp_shelf_scroll(&mut self) {
+        let max = self.shelf_max_scroll();
+        if self.shelf_scroll.target > max {
+            self.start_animation();
+            self.shelf_scroll.target = max;
         }
     }
 
@@ -1334,7 +1754,22 @@ impl App {
         self.invalidate()
     }
 
+    /// Sets the open notch's tick to what it shows: faster while synced
+    /// lyrics are lighting up as they are sung.
+    fn arm_progress_timer(&mut self) {
+        let playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
+        let synced = matches!(&self.lyrics_state, LyricsState::Found(l) if l.synced);
+        let interval = if self.lyrics_open && synced && playing { LYRICS_INTERVAL_MS } else { PROGRESS_INTERVAL_MS };
+        if interval != self.progress_interval {
+            self.progress_interval = interval;
+            unsafe {
+                SetTimer(Some(self.hwnd), PROGRESS_TIMER, interval, None);
+            }
+        }
+    }
+
     fn on_timer(&mut self) -> Result<()> {
+        self.arm_progress_timer();
         self.update_lyric_line(false);
         let playing = self.now_playing.as_ref().is_some_and(|np| np.playing);
         if playing { self.invalidate() } else { Ok(()) }
@@ -1344,10 +1779,9 @@ impl App {
         self.start_animation();
         self.lyrics_open = !self.lyrics_open;
         self.lyrics_reveal.target = if self.lyrics_open { 100.0 } else { 0.0 };
-        let width = if self.lyrics_open { EXPANDED.width } else { PLAYER_ONLY_WIDTH };
-        self.panel_width.target = width;
+        self.panel_width.target = if self.lyrics_open { EXPANDED.width } else { PLAYER_ONLY_WIDTH };
         if self.hovered {
-            self.width.target = width;
+            self.retarget();
         }
     }
 
@@ -1431,12 +1865,15 @@ impl App {
         if !settled || !open {
             return None;
         }
-        render::control_at(self.pixmap.width(), self.scale, self.panel_width.value, (x, y))
+        render::control_at(self.pixmap.width(), self.scale, (x, y))
     }
 
     /// Starts dragging a Control Center slider or the progress knob if the
     /// press is on one.
     fn on_mouse_down(&mut self, x: f32, y: f32) -> Result<()> {
+        if self.on_shelf_page() {
+            return self.on_shelf_down(x, y);
+        }
         if self.output_picker {
             self.output_pressed = self.output_row_at(x, y);
             return self.invalidate();
@@ -1558,6 +1995,10 @@ impl App {
             self.end_alert();
             return Ok(());
         }
+        // The shelf handles its own presses; nothing under it is the player's.
+        if self.on_shelf_page() {
+            return Ok(());
+        }
         if self.on_controls_page() {
             self.release_toggles();
             match self.control_at(x, y) {
@@ -1656,6 +2097,7 @@ impl App {
             self.hide_shadow();
             self.shadow_shape = None;
 
+            self.shelf.set_scale(self.scale);
             let mon = info.rcMonitor;
             self.monitor = mon;
             self.origin = POINT {
@@ -1665,6 +2107,22 @@ impl App {
         }
         self.redraw()
     }
+}
+
+/// The page (-100 shelf, 0 player, 100 Control Center) a touchpad drag that
+/// let go at `raw` settles on: the next one in the drag's direction once a
+/// fifth of the way there, else back.
+fn page_after_drag(raw: f32, rightward: bool) -> f32 {
+    let base = ((raw / 100.0).floor() * 100.0).clamp(-100.0, 100.0);
+    let into = raw - base;
+    let target = if rightward {
+        if into > 20.0 { base + 100.0 } else { base }
+    } else if into < 80.0 {
+        base
+    } else {
+        base + 100.0
+    };
+    target.clamp(-100.0, 100.0)
 }
 
 /// Low/high words of `lparam` as signed client coordinates.
@@ -1691,14 +2149,31 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         WM_MOUSEMOVE => {
             let (x, y) = mouse_pos(lparam);
+            // A file pressed on the shelf and moved: drag it out. The drag
+            // runs a loop of its own, so the app state must be free.
+            if let Some(path) = with_app(|app| app.shelf_drag_start(x, y)).flatten() {
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                DRAGGING_OUT.store(true, Ordering::Relaxed);
+                if let Err(e) = shelf::drag_out(hwnd, &path) {
+                    eprintln!("drag out failed: {e}");
+                }
+                DRAGGING_OUT.store(false, Ordering::Relaxed);
+                with_app(App::after_drag_out);
+                return LRESULT(0);
+            }
             let result = with_app(|app| {
                 if app.seeking.is_some() {
                     app.on_seek_move(x, y)
                 } else if app.slider_drag.is_some() {
                     app.on_slider_move(y)
+                } else if app.shelf_pressed.is_some() {
+                    Ok(())
                 } else {
                     app.set_hovered(true);
                     app.on_picker_hover(x, y);
+                    app.on_shelf_hover(x, y);
                     Ok(())
                 }
             });
@@ -1708,7 +2183,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         WM_MOUSELEAVE => {
-            with_app(|app| app.set_hovered(false));
+            // Windows reports a leave whenever tracking breaks, including
+            // when another program held the mouse (a drag just dropped here):
+            // still over the notch, keep watching instead of closing it.
+            let mut cursor = POINT::default();
+            let over = unsafe { GetCursorPos(&mut cursor).is_ok() && WindowFromPoint(cursor) == hwnd };
+            with_app(|app| if over { app.rearm_mouse_leave() } else { app.set_hovered(false) });
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -1721,7 +2201,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_LBUTTONUP => {
             let (x, y) = mouse_pos(lparam);
             let result = with_app(|app| {
-                if app.seeking.is_some() {
+                if app.shelf_pressed.is_some() {
+                    app.finish_shelf_press(x, y)
+                } else if app.seeking.is_some() {
                     app.finish_seek()
                 } else if app.slider_drag.is_some() {
                     app.finish_slider()
@@ -1739,6 +2221,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         // own releases clear the drag state first.
         WM_CAPTURECHANGED => {
             let result = with_app(|app| {
+                if app.shelf_pressed.take().is_some() {
+                    return app.invalidate();
+                }
                 let slider = app.slider_drag.take().is_some();
                 if app.seeking.take().is_some() || slider {
                     app.start_animation();
@@ -1751,6 +2236,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             });
             if let Some(Err(e)) = result {
                 eprintln!("seek cancel failed: {e}");
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEHWHEEL => {
+            // High word of wparam: signed sideways travel, positive to the right.
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            with_app(|app| app.on_sideways_wheel(delta));
+            LRESULT(0)
+        }
+        WM_SHELF => {
+            if let Some(Err(e)) = with_app(|app| {
+                app.shelf.take_icons();
+                app.invalidate()
+            }) {
+                eprintln!("shelf redraw failed: {e}");
             }
             LRESULT(0)
         }
@@ -1835,6 +2335,37 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             with_app(App::update_obstruction);
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == TRIM_TIMER => {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TRIM_TIMER);
+            }
+            let idle = with_app(|app| !app.hovered && !app.is_animating() && app.alert.is_none()).unwrap_or(false);
+            // The settings window trims when it closes.
+            if idle && !settings_window::is_open() {
+                trim_working_set();
+                unsafe {
+                    SetTimer(Some(hwnd), TRIM_TIMER, TRIM_REPEAT_MS, None);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == CLOCK_TIMER => {
+            schedule_clock(hwnd);
+            update_clock();
+            LRESULT(0)
+        }
+        // The clock was set, or the machine woke from sleep: the time may
+        // have jumped.
+        WM_TIMECHANGE => {
+            schedule_clock(hwnd);
+            update_clock();
+            LRESULT(0)
+        }
+        WM_POWERBROADCAST if wparam.0 as u32 == PBT_APMRESUMEAUTOMATIC => {
+            schedule_clock(hwnd);
+            update_clock();
+            LRESULT(1)
+        }
         WM_TIMER if wparam.0 == ALERT_TIMER => {
             with_app(App::end_alert);
             LRESULT(0)
@@ -1861,18 +2392,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_TRAY => {
-            // The menu runs its own message loop; the app state must not be
-            // borrowed meanwhile, or every message in that loop is lost.
-            let Some(settings) = with_app(|app| app.settings) else { return LRESULT(0) };
-            if let Some(next) = tray::on_click(hwnd, lparam, settings) {
-                next.save();
-                if let Some(Err(e)) = with_app(|app| app.apply_settings(next)) {
-                    eprintln!("applying settings failed: {e}");
-                }
+            tray::on_click(hwnd, lparam);
+            LRESULT(0)
+        }
+        WM_SETTINGS_CHANGED => {
+            let next = Settings::from_bits(wparam.0);
+            if let Some(Err(e)) = with_app(|app| app.apply_settings(next)) {
+                eprintln!("applying settings failed: {e}");
             }
             LRESULT(0)
         }
         WM_DESTROY => {
+            settings_window::close();
+            shelf::revoke_drop_target(hwnd);
             // Hand the volume keys back to Windows.
             volume_keys::uninstall();
             tray::remove(hwnd);

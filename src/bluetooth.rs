@@ -3,6 +3,9 @@
 //!
 //! Polls instead of using a device watcher: a watcher filtered on
 //! "connected" does not reliably report a device that stops matching.
+//!
+//! Battery levels are the ones Windows itself reports (as in Settings),
+//! read from the PnP manager; see `read_batteries`.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,10 +13,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use windows::core::{Result, HSTRING};
+use windows::core::{w, Result, GUID, HSTRING, PCWSTR};
 use windows::Devices::Bluetooth::{BluetoothConnectionStatus, BluetoothDevice, BluetoothLEDevice};
 use windows::Devices::Enumeration::DeviceInformation;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    CM_Get_DevNode_PropertyW, CM_Get_Device_ID_ListW, CM_Get_Device_ID_List_SizeW, CM_Locate_DevNodeW,
+    CM_GETIDLIST_FILTER_ENUMERATOR, CM_GETIDLIST_FILTER_PRESENT, CM_LOCATE_DEVNODE_NORMAL, CR_BUFFER_SMALL, CR_SUCCESS,
+};
+use windows::Win32::Devices::Properties::{DEVPROPTYPE, DEVPROP_TYPE_BYTE, DEVPROP_TYPE_STRING};
+use windows::Win32::Foundation::{DEVPROPKEY, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
@@ -23,6 +31,19 @@ pub const WM_BLUETOOTH: u32 = WM_APP + 6;
 const POLL: Duration = Duration::from_secs(2);
 /// A device must stay gone this long to count as disconnected.
 const DISCONNECT_GRACE: Duration = Duration::from_secs(8);
+/// Battery levels are re-read every this many polls, as they change slowly;
+/// sooner (`BATTERY_POLLS_PENDING`) while a connected device has none yet,
+/// since Windows reads a newly connected device's level a moment later.
+const BATTERY_POLLS: u32 = 15;
+const BATTERY_POLLS_PENDING: u32 = 3;
+
+/// Windows' battery level for a Bluetooth device, a byte in percent, kept
+/// on the device's PnP node (Settings shows the same value).
+const BATTERY_KEY: DEVPROPKEY =
+    DEVPROPKEY { fmtid: GUID::from_u128(0x104ea319_6ee2_4701_bd47_8ddbf425bbe5), pid: 2 };
+/// DEVPKEY_Bluetooth_DeviceAddress: the address as 12 hex digits.
+const ADDRESS_KEY: DEVPROPKEY =
+    DEVPROPKEY { fmtid: GUID::from_u128(0x2bd67d8b_8beb_48d5_87e0_6cda3428040a), pid: 1 };
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum DeviceKind {
@@ -37,6 +58,9 @@ pub enum DeviceKind {
 pub struct Device {
     pub name: String,
     pub kind: DeviceKind,
+    /// Charge in percent, when Windows reports it (most earbuds and
+    /// headsets, and LE keyboards and mice).
+    pub battery: Option<u8>,
 }
 
 #[derive(Default)]
@@ -96,14 +120,18 @@ fn run(hwnd: isize, state: Arc<Mutex<State>>, repeat_quiet_secs: Arc<AtomicU64>)
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
     let classic = BluetoothDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected)?;
     let le = BluetoothLEDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected)?;
-    // Device kind costs a lookup; it never changes, so it is cached by id.
-    let mut kinds: HashMap<String, DeviceKind> = HashMap::new();
+    // Kind and address cost a lookup and never change, so they are cached
+    // by id.
+    let mut details: HashMap<String, (DeviceKind, Option<u64>)> = HashMap::new();
+    let mut batteries;
+    let mut polls_since_batteries = 0;
 
     // Whatever is connected at start-up shows in the indicator, without alerts.
     let mut tracker = Tracker::default();
     loop {
-        if let Some(now) = connected(&classic, &le, &mut kinds) {
-            tracker.connected = now;
+        if let Some(found) = connected(&classic, &le, &mut details) {
+            batteries = read_batteries();
+            tracker.connected = with_batteries(found, &batteries);
             break;
         }
         thread::sleep(POLL);
@@ -115,7 +143,18 @@ fn run(hwnd: isize, state: Arc<Mutex<State>>, repeat_quiet_secs: Arc<AtomicU64>)
         thread::sleep(POLL);
         // A failed lookup says nothing about the devices; skip it rather
         // than read it as everything disconnecting.
-        let Some(now) = connected(&classic, &le, &mut kinds) else { continue };
+        let Some(found) = connected(&classic, &le, &mut details) else { continue };
+        polls_since_batteries += 1;
+        // A device just connected is read at once, so its alert can show
+        // its level if Windows has it already.
+        let new = found.iter().any(|(d, _)| !tracker.connected.iter().any(|c| c.name == d.name));
+        let pending = tracker.connected.iter().any(|d| d.battery.is_none());
+        let due = if pending { BATTERY_POLLS_PENDING } else { BATTERY_POLLS };
+        if new || polls_since_batteries >= due {
+            batteries = read_batteries();
+            polls_since_batteries = 0;
+        }
+        let now = with_batteries(found, &batteries);
         let quiet = Duration::from_secs(repeat_quiet_secs.load(Ordering::Relaxed));
         let (changed, events) = tracker.update(now, Instant::now(), quiet);
         if !changed {
@@ -149,11 +188,21 @@ impl Tracker {
         let mut events = Vec::new();
         for device in &polled {
             self.missing_since.remove(&device.name);
-            if !self.connected.iter().any(|d| d.name == device.name) {
-                self.connected.push(device.clone());
-                changed = true;
-                if self.note_change(&device.name, true, now, quiet) {
-                    events.push((device.clone(), true));
+            match self.connected.iter_mut().find(|d| d.name == device.name) {
+                // Still connected; its battery level may have moved, which
+                // updates the indicator but is no event.
+                Some(known) => {
+                    if known != device {
+                        *known = device.clone();
+                        changed = true;
+                    }
+                }
+                None => {
+                    self.connected.push(device.clone());
+                    changed = true;
+                    if self.note_change(&device.name, true, now, quiet) {
+                        events.push((device.clone(), true));
+                    }
                 }
             }
         }
@@ -195,46 +244,144 @@ fn post(hwnd: isize) {
     }
 }
 
-/// Connected devices, or `None` if a lookup failed. A device that is both
-/// classic and LE (common for earbuds) is listed once, by name: its id
-/// differs between the two, so ids cannot tell devices apart.
-fn connected(classic: &HSTRING, le: &HSTRING, kinds: &mut HashMap<String, DeviceKind>) -> Option<Vec<Device>> {
-    let mut devices: Vec<Device> = Vec::new();
+/// Connected devices with their Bluetooth addresses, or `None` if a lookup
+/// failed. A device that is both classic and LE (common for earbuds) is
+/// listed once, by name, with both addresses: its id differs between the
+/// two, so ids cannot tell devices apart, and Windows may report its battery
+/// on either.
+fn connected(
+    classic: &HSTRING,
+    le: &HSTRING,
+    details: &mut HashMap<String, (DeviceKind, Option<u64>)>,
+) -> Option<Vec<(Device, Vec<u64>)>> {
+    let mut devices: Vec<(Device, Vec<u64>)> = Vec::new();
     for (selector, is_le) in [(classic, false), (le, true)] {
         let found = DeviceInformation::FindAllAsyncAqsFilter(selector).and_then(|op| op.get()).ok()?;
         for info in found {
             let (Ok(id), Ok(name)) = (info.Id(), info.Name()) else { continue };
             let (id, name) = (id.to_string(), name.to_string());
-            if name.is_empty() || devices.iter().any(|d| d.name == name) {
+            if name.is_empty() {
                 continue;
             }
-            let kind = *kinds.entry(id.clone()).or_insert_with(|| match lookup_kind(&id, is_le) {
-                // Some devices report no class at all; their name may still tell.
-                DeviceKind::Other => kind_from_name(&name),
-                kind => kind,
-            });
-            devices.push(Device { name, kind });
+            let (kind, address) = match details.get(&id) {
+                Some(&known) => known,
+                None => match lookup(&id, is_le) {
+                    // Cached only when the lookup worked, so a failed one is
+                    // tried again on the next poll.
+                    Some((kind, address)) => {
+                        // Some devices report no class at all; their name may still tell.
+                        let kind = if kind == DeviceKind::Other { kind_from_name(&name) } else { kind };
+                        *details.entry(id).or_insert((kind, Some(address)))
+                    }
+                    None => (kind_from_name(&name), None),
+                },
+            };
+            match devices.iter_mut().find(|(d, _)| d.name == name) {
+                Some((_, addresses)) => addresses.extend(address),
+                None => devices.push((Device { name, kind, battery: None }, address.into_iter().collect())),
+            }
         }
     }
     Some(devices)
 }
 
-fn lookup_kind(id: &str, is_le: bool) -> DeviceKind {
+/// The devices, each with its battery level from `batteries` (by address).
+fn with_batteries(found: Vec<(Device, Vec<u64>)>, batteries: &HashMap<u64, u8>) -> Vec<Device> {
+    found
+        .into_iter()
+        .map(|(mut device, addresses)| {
+            device.battery = addresses.iter().find_map(|a| batteries.get(a)).copied();
+            device
+        })
+        .collect()
+}
+
+/// Kind and address of the device with `id`, or `None` if it could not be
+/// opened.
+fn lookup(id: &str, is_le: bool) -> Option<(DeviceKind, u64)> {
     let id = HSTRING::from(id);
-    let kind = if is_le {
-        BluetoothLEDevice::FromIdAsync(&id)
-            .and_then(|op| op.get())
-            .and_then(|d| d.Appearance())
-            .and_then(|a| a.RawValue())
-            .map(kind_from_appearance)
+    if is_le {
+        let device = BluetoothLEDevice::FromIdAsync(&id).and_then(|op| op.get()).ok()?;
+        let kind = device.Appearance().and_then(|a| a.RawValue()).map_or(DeviceKind::Other, kind_from_appearance);
+        Some((kind, device.BluetoothAddress().ok()?))
     } else {
-        BluetoothDevice::FromIdAsync(&id)
-            .and_then(|op| op.get())
-            .and_then(|d| d.ClassOfDevice())
-            .and_then(|c| c.RawValue())
-            .map(kind_from_class_of_device)
-    };
-    kind.unwrap_or(DeviceKind::Other)
+        let device = BluetoothDevice::FromIdAsync(&id).and_then(|op| op.get()).ok()?;
+        let kind = device.ClassOfDevice().and_then(|c| c.RawValue()).map_or(DeviceKind::Other, kind_from_class_of_device);
+        Some((kind, device.BluetoothAddress().ok()?))
+    }
+}
+
+/// Battery levels Windows reports for Bluetooth devices, by address. They
+/// sit on the devices' PnP nodes: a classic device's hands-free node
+/// (`BTHENUM\...`), an LE device's own node (`BTHLE\DEV_...`). Read from the
+/// PnP manager, which needs no connection to the device, unlike its GATT
+/// battery service, and covers classic devices too.
+fn read_batteries() -> HashMap<u64, u8> {
+    let mut levels = HashMap::new();
+    for enumerator in [w!("BTHENUM"), w!("BTHLE")] {
+        for id in device_ids(enumerator) {
+            let mut node = 0u32;
+            if unsafe { CM_Locate_DevNodeW(&mut node, PCWSTR(id.as_ptr()), CM_LOCATE_DEVNODE_NORMAL) } != CR_SUCCESS {
+                continue;
+            }
+            let Some(&[level]) = property(node, &BATTERY_KEY, DEVPROP_TYPE_BYTE).as_deref() else { continue };
+            let address = property(node, &ADDRESS_KEY, DEVPROP_TYPE_STRING).and_then(|bytes| parse_address(&bytes));
+            if let Some(address) = address.filter(|_| level <= 100) {
+                levels.insert(address, level);
+            }
+        }
+    }
+    levels
+}
+
+/// Instance ids (NUL-terminated UTF-16) of the present devices under
+/// `enumerator`.
+fn device_ids(enumerator: PCWSTR) -> Vec<Vec<u16>> {
+    let flags = CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT;
+    // The list can grow between sizing the buffer and filling it.
+    for _ in 0..3 {
+        let mut len = 0u32;
+        if unsafe { CM_Get_Device_ID_List_SizeW(&mut len, enumerator, flags) } != CR_SUCCESS {
+            return Vec::new();
+        }
+        let mut buffer = vec![0u16; len as usize];
+        match unsafe { CM_Get_Device_ID_ListW(enumerator, &mut buffer, flags) } {
+            CR_SUCCESS => {
+                return buffer
+                    .split(|&unit| unit == 0)
+                    .filter(|id| !id.is_empty())
+                    .map(|id| id.iter().copied().chain(Some(0)).collect())
+                    .collect();
+            }
+            CR_BUFFER_SMALL => continue,
+            _ => return Vec::new(),
+        }
+    }
+    Vec::new()
+}
+
+/// A device node's property, if it is set and of type `expected`.
+fn property(node: u32, key: &DEVPROPKEY, expected: DEVPROPTYPE) -> Option<Vec<u8>> {
+    let mut kind = DEVPROPTYPE(0);
+    let mut size = 0u32;
+    // The first call only sizes the value.
+    let _ = unsafe { CM_Get_DevNode_PropertyW(node, key, &mut kind, None, &mut size, 0) };
+    if size == 0 || size > 512 {
+        return None;
+    }
+    let mut buffer = vec![0u8; size as usize];
+    let got = unsafe { CM_Get_DevNode_PropertyW(node, key, &mut kind, Some(buffer.as_mut_ptr()), &mut size, 0) };
+    (got == CR_SUCCESS && kind == expected).then(|| {
+        buffer.truncate(size as usize);
+        buffer
+    })
+}
+
+/// A Bluetooth address property (UTF-16 hex digits, either case) as a number.
+fn parse_address(bytes: &[u8]) -> Option<u64> {
+    let units: Vec<u16> =
+        bytes.as_chunks::<2>().0.iter().map(|&pair| u16::from_le_bytes(pair)).take_while(|&u| u != 0).collect();
+    u64::from_str_radix(&String::from_utf16(&units).ok()?, 16).ok()
 }
 
 /// Classic Bluetooth "Class of Device": major class in bits 8-12, minor in
@@ -318,7 +465,33 @@ mod tests {
     const QUIET: Duration = Duration::from_secs(5 * 60);
 
     fn buds() -> Device {
-        Device { name: "Galaxy Buds2 Pro".into(), kind: DeviceKind::Headphones }
+        Device { name: "Galaxy Buds2 Pro".into(), kind: DeviceKind::Headphones, battery: None }
+    }
+
+    #[test]
+    fn battery_changes_update_without_alerts() {
+        let t0 = Instant::now();
+        let mut tracker = Tracker::default();
+        let charged = |level| Device { battery: Some(level), ..buds() };
+        assert_eq!(tracker.update(vec![charged(80)], t0, QUIET), (true, vec![(charged(80), true)]));
+        // A new level: the indicator changes, nothing is alerted.
+        assert_eq!(tracker.update(vec![charged(75)], t0 + POLL, QUIET), (true, vec![]));
+        assert_eq!(tracker.connected, vec![charged(75)]);
+        assert_eq!(tracker.update(vec![charged(75)], t0 + POLL * 2, QUIET), (false, vec![]));
+    }
+
+    #[test]
+    fn reads_addresses_and_levels_by_address() {
+        let utf16 = |s: &str| s.encode_utf16().chain(Some(0)).flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        assert_eq!(parse_address(&utf16("4142AEFF1990")), Some(0x4142AEFF1990));
+        assert_eq!(parse_address(&utf16("cc405f2b9114")), Some(0xCC405F2B9114));
+        assert_eq!(parse_address(&utf16("not hex")), None);
+        // Earbuds listed under two addresses take the level of either.
+        let batteries = HashMap::from([(2, 64)]);
+        let found = vec![(buds(), vec![1, 2]), (Device { name: "Mouse".into(), ..buds() }, vec![3])];
+        let devices = with_batteries(found, &batteries);
+        assert_eq!(devices[0].battery, Some(64));
+        assert_eq!(devices[1].battery, None);
     }
 
     #[test]
@@ -395,10 +568,14 @@ mod tests {
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap() };
         let classic = BluetoothDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected).unwrap();
         let le = BluetoothLEDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected).unwrap();
-        let devices = connected(&classic, &le, &mut HashMap::new()).expect("lookup");
+        let found = connected(&classic, &le, &mut HashMap::new()).expect("lookup");
+        let start = Instant::now();
+        let batteries = read_batteries();
+        println!("battery read: {:.2} ms, {} levels", start.elapsed().as_secs_f64() * 1000.0, batteries.len());
+        let devices = with_batteries(found, &batteries);
         println!("{} connected", devices.len());
         for d in devices {
-            println!("  {:?} ({:?})", d.name, d.kind);
+            println!("  {:?} ({:?}), battery {:?}", d.name, d.kind, d.battery);
         }
     }
 }
